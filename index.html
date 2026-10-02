@@ -847,6 +847,8 @@ const LAVA_BUCKET = 115;
     koyunun yününü dökmeden kırpar, Yün yapı/dekorasyon için kullanılır,
     Çiğ Koyun Eti ise lezzetli bir yiyecektir.                           */
 const WHEAT = 116, SHEARS = 117, WOOL = 118, RAW_MUTTON = 119;
+/*  Zombi düşürür; yenilebilir ama elmadan çok daha az doyurur. */
+const ROTTEN_FLESH = 120;
 /*  Altın kazma bilinçli olarak YOK: Minecraft'takine benzer bir "hızlı ama
     işe yaramaz" tuzak eşya eklemek, buradaki sade 4 kademeli zincire
     öğretici hiçbir şey katmazdı. Altın yerine zırha gidiyor.             */
@@ -970,7 +972,8 @@ const ITEMS = {
   [WHEAT]:         { name: "Buğday",          icon: "wheat",      wheat: 1 },
   [SHEARS]:        { name: "Makas",           icon: "shears",     shears: 1, maxStack: 1, rarity: "uncommon" },
   [WOOL]:          { name: "Yün",             icon: "wool",       wool: 1 },
-  [RAW_MUTTON]:    { name: "Çiğ Koyun Eti",   icon: "mutton",     food: 1 }
+  [RAW_MUTTON]:    { name: "Çiğ Koyun Eti",   icon: "mutton",     food: 1 },
+  [ROTTEN_FLESH]:  { name: "Çürük Et",        icon: "rotten",     food: 1 }
 };
 
 /*  Kazmaları tablodan üretiyoruz; elle dört kayıt yazmak, kademe/hız/nadirlik
@@ -1203,7 +1206,7 @@ const PALETTE = BLOCKS.map((b, i) => (b && b.selectable ? i : 0))
                                COAL, IRON_ORE_ITEM, IRON_INGOT,
                                GOLD_ORE_ITEM, GOLD_INGOT, DIAMOND,
                                WOOD_PICK, STONE_PICK, IRON_PICK, DIAMOND_PICK,
-                               WHEAT, SHEARS, WOOL, RAW_MUTTON]);
+                               WHEAT, SHEARS, WOOL, RAW_MUTTON, ROTTEN_FLESH]);
 
 /* ===================== ZIRH / EKİPMAN SİSTEMİ =============================
    build-minecraft-inventory-system referans alınarak eklendi: 4 ayrı zırh
@@ -7429,6 +7432,355 @@ const _sheepLook = new THREE.Vector3();
 const _sheepLookY = new THREE.Vector3(0, 0.55, 0);
 
 /* =========================================================================
+   ZOMBİ (ZOMBIE) — geceleri doğan, oyuncuyu kovalayan düşman mob
+   -------------------------------------------------------------------------
+   - Prosedürel voxel zombi: yeşil ten, mavi gömlek, koyu pantolon, öne uzanmış kollar.
+   - Gece (güneş ufkun altındayken) oyuncunun 16-28 blok çevresindeki kuru karada
+     doğar; aynı anda en fazla ZOMBIE_CFG.MAX tane. Yaratıcı modda doğmaz/saldırmaz.
+   - Gündüz açık havada kalan zombi yanar ve ölür; gölgede/mağarada kalabilir.
+   - Oyuncuyu görünce kovalar, yakına gelince vurur (zırh hasarı azaltır) ve geri iter.
+   - Sol tık ile vurulur (elde kazma varsa daha çok hasar). Ölünce 0-2 Çürük Et düşer.
+   - Kaydedilmez: dünya yüklenince/doğunca temizlenir, gece yeniden doğar.
+   ========================================================================= */
+const ZOMBIE_CFG = {
+  MAX: 4, HP: 14,
+  SPEED: 2.5, SIGHT: 24, SPAWN_MIN: 16, SPAWN_MAX: 28, DESPAWN: 56,
+  REACH: 1.25, DMG: 2, HIT_CD: 1.2, KNOCKBACK: 7,
+  SPAWN_EVERY: 3.0, NIGHT_SUN: -0.02, DAY_SUN: 0.12,
+  PLAYER_REACH: 4.2, PLAYER_CD: 0.4
+};
+const zombies = (() => {
+  const list = [];
+  const geo = {
+    head:  new THREE.BoxGeometry(0.50, 0.50, 0.50),
+    torso: new THREE.BoxGeometry(0.50, 0.70, 0.26),
+    arm:   new THREE.BoxGeometry(0.20, 0.72, 0.20),
+    leg:   new THREE.BoxGeometry(0.24, 0.76, 0.24),
+    eye:   new THREE.BoxGeometry(0.10, 0.06, 0.02),
+    mouth: new THREE.BoxGeometry(0.22, 0.05, 0.02)
+  };
+  let spawnCd = 4, hitCdPlayer = 0, groanCd = 0;
+
+  function makeMats() {
+    const m = (c) => new THREE.MeshStandardMaterial({ color: c, roughness: 0.9, emissive: 0x000000 });
+    return { skin: m(0x5f8f4a), shirt: m(0x2e6a8e), pants: m(0x2b2f6b), dark: m(0x1b1b1b) };
+  }
+
+  function build() {
+    const mats = makeMats();
+    const root = new THREE.Group();
+    root.name = "Zombi";
+    const add = (parent, g, mat, x, y, z) => {
+      const mesh = new THREE.Mesh(g, mat);
+      mesh.position.set(x, y, z);
+      mesh.castShadow = true;
+      parent.add(mesh);
+      return mesh;
+    };
+    // Bacaklar (pivot kalçada, 0.76 yükseklik)
+    const legs = [];
+    for (const lx of [-0.13, 0.13]) {
+      const pivot = new THREE.Group();
+      pivot.position.set(lx, 0.76, 0);
+      add(pivot, geo.leg, mats.pants, 0, -0.38, 0);
+      root.add(pivot);
+      legs.push(pivot);
+    }
+    add(root, geo.torso, mats.shirt, 0, 1.11, 0);
+    // Kollar öne uzanık (rotation.x = +PI/2 → -z yönü, yani modelin önü)
+    const arms = [];
+    for (const ax of [-0.35, 0.35]) {
+      const pivot = new THREE.Group();
+      pivot.position.set(ax, 1.42, 0);
+      pivot.rotation.x = Math.PI / 2;
+      add(pivot, geo.arm, mats.skin, 0, -0.34, 0);
+      root.add(pivot);
+      arms.push(pivot);
+    }
+    const head = new THREE.Group();
+    head.position.set(0, 1.70, 0);
+    add(head, geo.head, mats.skin, 0, 0, 0);
+    add(head, geo.eye, mats.dark, -0.12, 0.04, -0.255);
+    add(head, geo.eye, mats.dark,  0.12, 0.04, -0.255);
+    add(head, geo.mouth, mats.dark, 0, -0.13, -0.255);
+    root.add(head);
+    scene.add(root);
+    return { root, mats, legs, arms, head };
+  }
+
+  const chunkLoaded = (x, z) => chunkMap.has(ckey(Math.floor(x) >> CH_BITS, Math.floor(z) >> CH_BITS));
+
+  function hits(x, y, z) {
+    const r = 0.28;
+    for (const yy of [y + 0.05, y + 0.95, y + 1.7]) {
+      for (const cx of [x - r, x + r]) for (const cz of [z - r, z + r]) {
+        if (isSolid(getBlock(Math.floor(cx), Math.floor(yy), Math.floor(cz)))) return true;
+      }
+    }
+    return false;
+  }
+
+  function skyExposed(x, y, z) {
+    const bx = Math.floor(x), bz = Math.floor(z);
+    for (let yy = Math.floor(y) + 2; yy < Math.min(WY, Math.floor(y) + 40); yy++) {
+      if (isSolid(getBlock(bx, yy, bz))) return false;
+    }
+    return true;
+  }
+
+  function isNight() { return _sunDir.y < ZOMBIE_CFG.NIGHT_SUN; }
+  function isDay()   { return _sunDir.y > ZOMBIE_CFG.DAY_SUN; }
+
+  function groan(z) {
+    const d = Math.hypot(z.pos.x - player.pos.x, z.pos.z - player.pos.z);
+    const vol = Math.max(0, 1 - d / 22);
+    if (vol <= 0.02) return;
+    tone(88 + Math.random() * 28, 0.55, 0.07 * vol, "sawtooth");
+    noiseBurst(0.28, "bandpass", 260, 2, 0.04 * vol);
+  }
+  function sfxZombieHit() { tone(140, 0.12, 0.10, "square"); noiseBurst(0.10, "lowpass", 400, 1, 0.08); }
+  function sfxZombieDie() { tone(110, 0.7, 0.10, "sawtooth"); setTimeout(() => tone(60, 0.8, 0.08, "sine"), 120); }
+
+  const free = b => !isSolid(b) && b !== WATER && b !== LAVA;   // çim/çiçek geçilebilir
+
+  function trySpawnAt(x, z) {
+    if (!chunkLoaded(x, z)) return false;
+    const bx = Math.floor(x), bz = Math.floor(z);
+    const info = columnInfo(bx, bz);
+    if (info.biome === BIOME_OCEAN || info.biome === BIOME_RIVER) return false;
+    const y0 = Math.floor(player.pos.y);
+    // Sütunun en üstünden aşağı in: ilk katı blok yüzeydir (ağaç tepesi değilse).
+    for (let y = WY - 3; y > 1; y--) {
+      const b = getBlock(bx, y, bz);
+      if (!isSolid(b)) continue;
+      if (b === LEAVES || Math.abs(y + 1 - y0) > 20) return false;
+      if (free(getBlock(bx, y + 1, bz)) && free(getBlock(bx, y + 2, bz))) return add(bx + 0.5, y + 1, bz + 0.5);
+      return false;
+    }
+    return false;
+  }
+
+  function add(x, y, z) {
+    if (list.length >= ZOMBIE_CFG.MAX * 2) return false;
+    const m = build();
+    const z0 = {
+      model: m, pos: new THREE.Vector3(x, y, z), vel: new THREE.Vector3(),
+      hp: ZOMBIE_CFG.HP, onGround: false, phase: Math.random() * 6, yaw: Math.random() * 6.28,
+      wander: Math.random() * 6.28, idle: 0, hitCd: 0.6, flash: 0, burn: 0, groanCd: 2 + Math.random() * 4, stuck: 0
+    };
+    m.root.position.copy(z0.pos);
+    list.push(z0);
+    return z0;
+  }
+
+  function remove(i) {
+    const z = list[i];
+    scene.remove(z.model.root);
+    for (const k in z.model.mats) z.model.mats[k].dispose();
+    list.splice(i, 1);
+  }
+
+  function kill(i, silent) {
+    const z = list[i];
+    if (!silent) {
+      spawnParticles(z.pos.x, z.pos.y + 0.9, z.pos.z, LEAVES);
+      sfxZombieDie();
+      const n = Math.floor(Math.random() * 3);
+      if (n > 0) {
+        const left = invAdd(ROTTEN_FLESH, n);
+        updateHotbarCounts(); renderInventory();
+        if (left < n) toast(`🧟 Zombi öldü — ${n - left} Çürük Et düştü`);
+      }
+    }
+    remove(i);
+  }
+
+  function hurt(i, amount, fromX, fromZ, kb) {
+    const z = list[i];
+    z.hp -= amount;
+    z.flash = 1;
+    const dx = z.pos.x - fromX, dz = z.pos.z - fromZ, d = Math.hypot(dx, dz) || 1;
+    z.vel.x = dx / d * kb; z.vel.z = dz / d * kb;
+    if (z.onGround) z.vel.y = 4.5;
+    sfxZombieHit();
+    if (z.hp <= 0) { kill(i); return true; }
+    return false;
+  }
+
+  /* Işın zombiyi (3 noktalı gövde) yakalıyor mu? En yakınının indeksi ya da -1. */
+  function pick(origin, dir, maxDepth) {
+    let best = -1, bestDepth = Infinity;
+    for (let i = 0; i < list.length; i++) {
+      const z = list[i];
+      for (const hy of [0.45, 1.05, 1.65]) {
+        const tx = z.pos.x - origin.x, ty = z.pos.y + hy - origin.y, tz = z.pos.z - origin.z;
+        const depth = tx * dir.x + ty * dir.y + tz * dir.z;
+        if (depth < 0.15 || depth > maxDepth || depth >= bestDepth) continue;
+        if (tx * tx + ty * ty + tz * tz - depth * depth < 0.42 * 0.42) { best = i; bestDepth = depth; }
+      }
+    }
+    return best < 0 ? null : { index: best, depth: bestDepth };
+  }
+
+  /* Işının hedef bloğun yüzüne kadar aldığı mesafe (slab yöntemi). */
+  function rayBoxDist(o, d, b) {
+    let tmin = 0, tmax = Infinity;
+    const lo = [b.x, b.y, b.z], oo = [o.x, o.y, o.z], dd = [d.x, d.y, d.z];
+    for (let k = 0; k < 3; k++) {
+      if (Math.abs(dd[k]) < 1e-9) { if (oo[k] < lo[k] || oo[k] > lo[k] + 1) return Infinity; continue; }
+      let t1 = (lo[k] - oo[k]) / dd[k], t2 = (lo[k] + 1 - oo[k]) / dd[k];
+      if (t1 > t2) { const t = t1; t1 = t2; t2 = t; }
+      tmin = Math.max(tmin, t1); tmax = Math.min(tmax, t2);
+    }
+    return tmax >= tmin ? tmin : Infinity;
+  }
+  let aimed = -1;
+  function lookingAt(origin, dir, blockHit) {
+    const p = pick(origin, dir, ZOMBIE_CFG.PLAYER_REACH);
+    if (p && blockHit && p.depth > rayBoxDist(origin, dir, blockHit) + 0.05) { aimed = -1; return false; }   // duvarın arkasında
+    aimed = p ? p.index : -1;
+    return aimed >= 0;
+  }
+
+  let playerCd = 0;
+  function attack() {
+    if (aimed < 0 || aimed >= list.length || playerCd > 0) return false;
+    playerCd = ZOMBIE_CFG.PLAYER_CD;
+    const tier = heldPickTier(slots[selected] && slots[selected].id);
+    const dmg = tier >= 0 ? 3 + tier : 2;
+    hurt(aimed, dmg, player.pos.x, player.pos.z, 5);
+    aimed = -1;
+    return true;
+  }
+
+  function status() {
+    if (!list.length) return "Zombi: yok" + (isNight() ? " (gece!)" : "");
+    let nearest = Infinity;
+    for (const z of list) nearest = Math.min(nearest, z.pos.distanceTo(player.pos));
+    return `Zombi: ${list.length} · en yakın ${nearest.toFixed(1)}m`;
+  }
+
+  function move(z, mx, mz, speed, dt) {
+    const inWater = getBlock(Math.floor(z.pos.x), Math.floor(z.pos.y + 0.3), Math.floor(z.pos.z)) === WATER;
+    const sp = inWater ? speed * 0.55 : speed;
+    const kx = z.vel.x, kz = z.vel.z;                 // geri tepme
+    const vx = mx * sp + kx, vz = mz * sp + kz;
+    z.vel.x *= Math.max(0, 1 - 6 * dt); z.vel.z *= Math.max(0, 1 - 6 * dt);
+    let blocked = false;
+    const nx = z.pos.x + vx * dt;
+    if (!hits(nx, z.pos.y, z.pos.z)) z.pos.x = nx; else blocked = true;
+    const nz = z.pos.z + vz * dt;
+    if (!hits(z.pos.x, z.pos.y, nz)) z.pos.z = nz; else blocked = true;
+    if (blocked && z.onGround && speed > 0) z.vel.y = 8.0;   // 1 blokluk engele zıpla
+
+    // Dikey fizik
+    if (inWater) z.vel.y = Math.min(z.vel.y + 40 * dt, 2.0);
+    else z.vel.y -= GRAVITY * dt;
+    z.vel.y = Math.max(z.vel.y, -40);
+    const ny = z.pos.y + z.vel.y * dt;
+    z.onGround = false;
+    if (!hits(z.pos.x, ny, z.pos.z)) z.pos.y = ny;
+    else {
+      if (z.vel.y < 0) { z.onGround = true; z.pos.y = Math.floor(z.pos.y + 0.001) + (hits(z.pos.x, Math.floor(z.pos.y + 0.001), z.pos.z) ? 1 : 0); }
+      z.vel.y = 0;
+    }
+    return Math.hypot(vx, vz);
+  }
+
+  function update(dt) {
+    if (!ready) return;
+    playerCd = Math.max(0, playerCd - dt);
+    hitCdPlayer = Math.max(0, hitCdPlayer - dt);
+
+    // Doğma
+    spawnCd -= dt;
+    if (spawnCd <= 0) {
+      spawnCd = ZOMBIE_CFG.SPAWN_EVERY;
+      if (isNight() && !health.god && !health.dead && list.length < ZOMBIE_CFG.MAX) {
+        for (let t = 0; t < 8; t++) {
+          const a = Math.random() * Math.PI * 2;
+          const d = ZOMBIE_CFG.SPAWN_MIN + Math.random() * (ZOMBIE_CFG.SPAWN_MAX - ZOMBIE_CFG.SPAWN_MIN);
+          if (trySpawnAt(player.pos.x + Math.cos(a) * d, player.pos.z + Math.sin(a) * d)) break;
+        }
+      }
+    }
+
+    for (let i = list.length - 1; i >= 0; i--) {
+      const z = list[i];
+      const dx = player.pos.x - z.pos.x, dz = player.pos.z - z.pos.z;
+      const dist = Math.hypot(dx, dz);
+      if (dist > ZOMBIE_CFG.DESPAWN || z.pos.y < -5 || !chunkLoaded(z.pos.x, z.pos.z)) { remove(i); continue; }
+
+      // Gün ışığında yanma
+      if (isDay() && skyExposed(z.pos.x, z.pos.y, z.pos.z)) {
+        z.burn += dt;
+        if (Math.random() < dt * 8) spawnEmber(z.pos.x, z.pos.y + 1.0 + Math.random() * 0.8, z.pos.z, { vy: 1.2, life: 0.5, color: 0xff7a22 });
+        if (z.burn >= 1) { z.burn = 0; z.hp -= 2; z.flash = 0.7; if (z.hp <= 0) { kill(i); continue; } }
+      }
+
+      // Karar: kovala / gez
+      let mx = 0, mz = 0, speed = 0;
+      const chasing = !health.god && !health.dead && dist < ZOMBIE_CFG.SIGHT;
+      if (chasing) {
+        if (dist > 0.01) { mx = dx / dist; mz = dz / dist; }
+        speed = dist > ZOMBIE_CFG.REACH * 0.8 ? ZOMBIE_CFG.SPEED : 0;
+        z.yaw = Math.atan2(-mx, -mz);
+      } else {
+        z.idle -= dt;
+        if (z.idle <= 0) { z.idle = 2 + Math.random() * 4; z.wander += (Math.random() - 0.5) * 3; z.stuck = Math.random() < 0.4 ? 1 : 0; }
+        if (!z.stuck) { mx = Math.sin(z.wander); mz = Math.cos(z.wander); speed = 0.9; z.yaw = Math.atan2(-mx, -mz); }
+      }
+      const moved = move(z, mx, mz, speed, dt);
+
+      // Saldırı
+      z.hitCd = Math.max(0, z.hitCd - dt);
+      if (chasing && dist < ZOMBIE_CFG.REACH && Math.abs(player.pos.y - z.pos.y) < 1.6 && z.hitCd <= 0) {
+        z.hitCd = ZOMBIE_CFG.HIT_CD;
+        const reduce = Math.min(0.8, armorDefense() * 0.025);
+        const dmg = Math.max(1, Math.round(ZOMBIE_CFG.DMG * (1 - reduce)));
+        if (damage(dmg, "zombie")) {
+          const d = dist || 1;
+          player.vel.x += -dx / d * 5; player.vel.z += -dz / d * 5; player.vel.y = Math.max(player.vel.y, 4);
+        }
+      }
+
+      z.groanCd -= dt;
+      if (z.groanCd <= 0 && dist < 22) { z.groanCd = 5 + Math.random() * 7; groan(z); }
+
+      // Görsel
+      z.phase += moved * dt * 3.2;
+      z.flash = Math.max(0, z.flash - dt * 3.5);
+      const e = z.flash * 0.6;
+      for (const k in z.model.mats) z.model.mats[k].emissive.setRGB(e, e * 0.12, e * 0.12);
+      z.model.root.position.copy(z.pos);
+      z.model.root.rotation.y = z.yaw;
+      const sw = moved > 0.1 ? Math.sin(z.phase) * 0.6 : 0;
+      z.model.legs[0].rotation.x = sw; z.model.legs[1].rotation.x = -sw;
+      const bob = Math.sin(performance.now() * 0.004 + i) * 0.06;
+      z.model.arms[0].rotation.x = Math.PI / 2 + bob + sw * 0.12;
+      z.model.arms[1].rotation.x = Math.PI / 2 - bob - sw * 0.12;
+      z.model.head.rotation.y = Math.sin(performance.now() * 0.0015 + i * 2) * 0.12;
+    }
+  }
+
+  function reset() { for (let i = list.length - 1; i >= 0; i--) remove(i); spawnCd = 4; aimed = -1; }
+  function count() { return list.length; }
+
+  /* /zombie komutu için: oyuncunun önüne n zombi koyar. */
+  function spawnNear(n) {
+    let made = 0;
+    for (let k = 0; k < n * 8 && made < n; k++) {
+      const a = player.yaw + (Math.random() - 0.5) * 1.2;      // bakış yönü: (-sin, -cos)
+      const d = 6 + Math.random() * 4;
+      if (trySpawnAt(player.pos.x - Math.sin(a) * d, player.pos.z - Math.cos(a) * d)) made++;
+    }
+    return made;
+  }
+
+  return { update, lookingAt, attack, status, reset, count, spawnNear };
+})();
+
+/* =========================================================================
    PLAYER AVATAR — visible blocky character + third-person camera
 
    Depends on (all already exist in the file): THREE, scene, camera, player,
@@ -7964,6 +8316,7 @@ function raycastFluidTarget(origin, dir, maxDist) {
 let target = null;
 let targetDog = false;
 let targetSheep = false;
+let targetZombie = false;
 const _dirVec = new THREE.Vector3();
 
 function updateTarget() {
@@ -7973,7 +8326,8 @@ function updateTarget() {
   targetDog = dog.lookingAt(o, _dirVec);
   targetSheep = sheep.lookingAt(o, _dirVec);
   target = raycastVoxel(o, _dirVec, 6.5);
-  if (target && !targetDog && !targetSheep) {
+  targetZombie = zombies.lookingAt(o, _dirVec, target);
+  if (target && !targetDog && !targetSheep && !targetZombie) {
     outline.visible = true;
     outline.position.set(target.x + 0.5, target.y + 0.5, target.z + 0.5);
   } else outline.visible = false;
@@ -10483,6 +10837,25 @@ ITEM_ART.mutton = [
   "................"
 ];
 
+ITEM_ART.rotten = [
+  "................",
+  "................",
+  "....bbbb........",
+  "...bggggb.......",
+  "..bggbgggb......",
+  "..bgggggggb.....",
+  "..bggggbggb.....",
+  "..bgggggggggb...",
+  "...bggggggggb...",
+  "...bgggbggbb....",
+  "....bbbbbbb.....",
+  ".........bgg....",
+  "..........gg....",
+  "................",
+  "................",
+  "................"
+];
+
 /*  Zırh parçaları: `m`/`M` malzemeye göre boyanır (bkz. drawItemIcon),
     ART_COLORS'ta karşılığı yok — bu yüzden ayrı bir switch ile ele alınır. */
 ITEM_ART.armor_helmet = [
@@ -11135,9 +11508,10 @@ function updateHUD(dt) {
     const p = player.pos;
     const tgtName = targetDog
       ? "Köpek — sol tık: sev, sağ tık: ödül / bilgi"
+      : (targetZombie ? "Zombi — sol tık: vur!"
       : (targetSheep
           ? "Koyun — sol tık: sev/kırp, sağ tık: besle / makasla kırp"
-          : (target ? (BLOCKS[getBlock(target.x, target.y, target.z)]?.name || "Unknown") : "Air"));
+          : (target ? (BLOCKS[getBlock(target.x, target.y, target.z)]?.name || "Unknown") : "Air")));
     const info = columnInfo(Math.floor(p.x), Math.floor(p.z));
     infoEl.textContent =
       `FPS: ${fps}\n` +
@@ -11147,6 +11521,7 @@ function updateHUD(dt) {
       `Target: ${tgtName}\n` +
       `${dog.status()}\n` +
       `${sheep.status()}\n` +
+      `${zombies.status()}\n` +
       `Chunks: ${streamStats.loaded} loaded  |  queue g${streamStats.pendingGen} m${streamStats.pendingMesh}\n` +
       `Render: ${RENDER_DIST} ch (${RENDER_DIST * CH} blocks)  Seed: ${worldSeed}\n` +
       `Fly: ${player.fly ? "ON" : "OFF"} | Time: ${fastTime ? "FAST" : "NORMAL"} | ` +
@@ -11243,6 +11618,7 @@ const DEATH_MSG = {
   lava:      "Lavda eridin.",
   void:      "Dünyanın altına düştün.",
   starve:    "Açlıktan öldün.",
+  zombie:    "Bir zombi seni yakaladı.",
   other:     "Hayatta kalamadın."
 };
 
@@ -11580,6 +11956,17 @@ function setCreative(on) {
 
 function eatFood() {
   if (health.dead) return;
+  if (invCount(APPLE) <= 0 && invCount(ROTTEN_FLESH) > 0) {
+    if (health.food >= SURV.MAX_FOOD - 0.5) { toast("Zaten toksun."); return; }
+    invTake(ROTTEN_FLESH, 1);
+    updateHotbarCounts();
+    health.food = Math.min(SURV.MAX_FOOD, health.food + 2);
+    sfxEat();
+    toast("🤢 Çürük et yedin (+2 açlık)");
+    lastStatusSig = "";
+    drawStatus();
+    return;
+  }
   if (invCount(APPLE) <= 0) { toast("Elman yok! Yaprak kırarak veya craft'layarak bul."); return; }
   if (health.food >= SURV.MAX_FOOD - 0.5) { toast("Zaten toksun."); return; }
   invTake(APPLE, 1);
@@ -12008,6 +12395,7 @@ const TERM_ALIASES = {
   ironingot: "demirkulcesi", ironblock: "demirblogu",
   gold: "hamaltin", rawgold: "hamaltin", goldore: "altincevheri",
   goldingot: "altinkulcesi", goldblock: "altinblogu",
+  rottenflesh: "curuket", zombieflesh: "curuket",
   apple: "elma", stick: "cubuk", wheat: "bugday", wool: "yun",
   shears: "makas", mutton: "cigkoyuneti", lambchop: "cigkoyuneti",
   bucket: "boskova", waterbucket: "sukovasi", lavabucket: "lavkovasi",
@@ -12316,6 +12704,13 @@ function cmdRd(args) {
   tlog(`Render mesafesi: ${RENDER_DIST} chunk`, "t-ok");
 }
 
+/* ---- /zombie ---- */
+function cmdZombie(args) {
+  const n = Math.max(1, Math.min(5, parseInt(args[0], 10) || 1));
+  const made = zombies.spawnNear(n);
+  tlog(made ? `${made} zombi doğdu` : "Uygun yer bulunamadı", made ? "t-ok" : "t-warn");
+}
+
 /* ---- /say ---- */
 function cmdSay(args) {
   if (!args.length) { termUsage("/say <mesaj>"); return; }
@@ -12358,6 +12753,7 @@ const TERM_COMMANDS = {
   seed:     { desc: "Dünya tohumunu gösterir",       usage: "/seed",                                run: cmdSeed },
   clear:    { desc: "Envanteri boşaltır",            usage: "/clear",                               run: cmdClear },
   rd:       { desc: "Render mesafesini ayarlar",     usage: "/rd [chunk]",                          run: cmdRd },
+  zombie:   { desc: "Önünde zombi doğurur",         usage: "/zombie [adet]",                       run: cmdZombie },
   say:      { desc: "Sohbete mesaj yazar",           usage: "/say <mesaj>",                         run: cmdSay },
 };
 TERM_COMMANDS.gm = { ...TERM_COMMANDS.gamemode, alias: 1 };   // kısa yol
@@ -12531,7 +12927,8 @@ renderer.domElement.addEventListener("mousedown", (e) => {
   if (!locked) return;
   // Sol tık köpek/koyun üstündeyken sevme/kırpma, blokta ise ilerlemeli kırma başlatır.
   if (e.button === 0) {
-    if (targetDog) { dog.pet(); mouseLeft = false; }
+    if (targetZombie) { zombies.attack(); mouseLeft = false; }
+    else if (targetDog) { dog.pet(); mouseLeft = false; }
     else if (targetSheep) { sheep.pet(); mouseLeft = false; }
     else { mouseLeft = true; creativeBreakCd = 0; }   // yaratıcıda ilk tık anında kırsın
   }
@@ -12855,6 +13252,7 @@ async function newWorld(seed, resume) {
   clearTorchLights();   // eski dünyanın meşaleleri yeni dünyada asılı kalmasın
   dog.reset();
   sheep.reset();
+  zombies.reset();
   reseed(seed);
   rememberSeed(seed);
 
@@ -12978,10 +13376,11 @@ function animate(now) {
     updatePlayer(dt);
     dog.update(dt);
     sheep.update(dt);
+    zombies.update(dt);
     avatar.update(dt);
     updateTarget();
-    updateBreaking(dt, mouseLeft && !targetDog && !targetSheep);
-    avatar.setMining(mouseLeft && !!target && !targetDog && !targetSheep);
+    updateBreaking(dt, mouseLeft && !targetDog && !targetSheep && !targetZombie);
+    avatar.setMining(mouseLeft && !!target && !targetDog && !targetSheep && !targetZombie);
 
     if (mouseRight && !targetDog && !targetSheep) {
       /*  Kova tekrarlamaz: basılı tutmak "doldur/boşalt/doldur..." diye
