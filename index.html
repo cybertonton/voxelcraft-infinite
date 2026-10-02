@@ -1757,16 +1757,20 @@ function columnInfo(x, z) {
 // Carve caves with 3D noise. Returns true when the voxel should be air.
 function isCave(x, y, z) {
   if (y < 2 || y > WY - 8) return false;
+  const t = 0.075 - Math.max(0, y - (SEA + 6)) * 0.0022;   // fewer near the surface
+  if (t <= 0) return false;
+  /*  Perf: the two bands must BOTH be inside their threshold, and nearly every
+      voxel is outside the first one — so test it before paying for the second
+      noise3. Same result as evaluating both, about half the noise calls.   */
   const a = nCave.noise3(x * 0.055, y * 0.085, z * 0.055);
+  if (Math.abs(a) >= t) return false;
   const b = nCave.noise3(x * 0.032 + 41.5, y * 0.048 - 17.2, z * 0.032 + 9.8);
   // Two overlapping tunnel systems; intersecting low-|value| bands form caves.
   /*  Doubling the world height doubled the depth of solid rock these bands
       run through, and the old threshold turned it into a sponge — nearly 17%
       of everything underground was air, which looks wrong and costs a great
       deal of mesh. Narrower bands give connected tunnels through solid rock. */
-  const t = 0.075 - Math.max(0, y - (SEA + 6)) * 0.0022;   // fewer near the surface
-  if (t <= 0) return false;
-  return (Math.abs(a) < t && Math.abs(b) < t + 0.028);
+  return Math.abs(b) < t + 0.028;
 }
 
 /*  ---- Lav gölcükleri ----
@@ -2266,19 +2270,22 @@ function generateTerrain(c) {
             cevheri de sıradan taş gibi oyar, yani mağara duvarında açıkta
             kalan damarlar oluşur. Oyuncunun mağara gezerken duvarda elmas
             görmesi tam olarak buradan doğuyor.                            */
-        if (t === STONE) {
-          const ore = oreAt(wx, y, wz);
-          if (ore) t = ore;
-        }
-
         // Rough bedrock floor at the bottom of the world.
         if (y > 0 && y <= 2 && ((hash3(wx, y, wz) % 100) < (3 - y) * 30)) t = BEDROCK;
 
+        /*  Perf: carve first, ore second. A voxel the cave pass turns to air
+            never needed its ore lookup; the outcome is identical because ore
+            only ever replaces STONE and caves overwrite whatever is there.   */
+        let carved = false;
         if (t !== BEDROCK && y > 0 && isCave(wx, y, wz)) {
           /*  Never carve the last few blocks under a body of water, or the
               ocean (and now every river) would drain into the cave system.   */
           const shielded = (h <= wl + 2) && (y >= h - 2);
-          if (!shielded) t = AIR;
+          if (!shielded) { t = AIR; carved = true; }
+        }
+        if (!carved && t === STONE) {
+          const ore = oreAt(wx, y, wz);
+          if (ore) t = ore;
         }
 
         /*  ---- Lav gölcükleri ----
@@ -3845,12 +3852,18 @@ scene.add(sunLight, sunLight.target);
     mapSize ile yeniden tahsis edilmesini sağlar (mapPass dahil).       */
 let shadowMapSize = SHADOW_MAP;
 let perfLow = false;
+let _curPR = Math.min(devicePixelRatio, 1.5);
 function adaptQuality() {
   if (fps === 0) return;
   if (!perfLow && fps < 45) perfLow = true;
   else if (perfLow && fps > 55) perfLow = false;
 
   TORCH_MAX_ACTIVE = perfLow ? 16 : 48;
+
+  /*  Fill-rate is the other big GPU lever: antialias cannot change at runtime,
+      but the pixel ratio can. Drop it while struggling, restore on recovery. */
+  const wantPR = perfLow ? 1 : Math.min(devicePixelRatio, 1.5);
+  if (wantPR !== _curPR) { _curPR = wantPR; renderer.setPixelRatio(wantPR); renderer.setSize(innerWidth, innerHeight); }
 
   const want = perfLow ? 1024 : 2048;
   if (want !== shadowMapSize) {
@@ -5153,11 +5166,13 @@ function activateTorch(tl) {
   activeTorches.add(tl);
 }
 
+const _torchNear = [];            // reused scratch list: no per-resync allocation
 function resyncTorchActivation(camPos) {
   if (torchLights.size === 0) return;
   const range = Math.min(TORCH_ACTIVE_RANGE, RENDER_DIST * CH * 0.85);
   const r2 = range * range;
-  const near = [];
+  const near = _torchNear;
+  near.length = 0;
   for (const tl of torchLights.values()) {
     const dx = tl.x + 0.5 - camPos.x, dy = tl.y + 0.6 - camPos.y, dz = tl.z + 0.5 - camPos.z;
     const d2 = dx * dx + dy * dy + dz * dz;
@@ -11501,6 +11516,8 @@ function toggleInventory(open) {
 }
 
 let fpsAccum = 0, fpsFrames = 0, fps = 0, hudTimer = 0;
+let _waterTintV = "", _lavaTintV = "";
+let _hudColX = NaN, _hudColZ = NaN, _hudInfo = null, _hudText = "";
 function updateHUD(dt) {
   hudTimer += dt;
   if (hudTimer >= 0.25) {
@@ -11512,8 +11529,15 @@ function updateHUD(dt) {
       : (targetSheep
           ? "Koyun — sol tık: sev/kırp, sağ tık: besle / makasla kırp"
           : (target ? (BLOCKS[getBlock(target.x, target.y, target.z)]?.name || "Unknown") : "Air")));
-    const info = columnInfo(Math.floor(p.x), Math.floor(p.z));
-    infoEl.textContent =
+    // columnInfo runs the full biome/height noise stack; only redo it when the
+    // player actually changed block column since the last HUD refresh.
+    const bx = Math.floor(p.x), bz = Math.floor(p.z);
+    if (bx !== _hudColX || bz !== _hudColZ) {
+      _hudColX = bx; _hudColZ = bz;
+      _hudInfo = columnInfo(bx, bz);
+    }
+    const info = _hudInfo;
+    const hudText =
       `FPS: ${fps}\n` +
       `XYZ: ${p.x.toFixed(1)} / ${p.y.toFixed(1)} / ${p.z.toFixed(1)}\n` +
       `Mod: ${health.god ? "YARATICI (J)" : "HAYATTA KALMA"}  |  Can: ${Math.round(health.hp)}/${SURV.MAX_HP}  Nefes: ${Math.round(health.air * 100)}%  Açlık: ${Math.round(health.food)}/${SURV.MAX_FOOD}  Elma: ${health.foodItems}\n` +
@@ -11533,9 +11557,11 @@ function updateHUD(dt) {
           bir yerde denge kurulamıyor (sonsuz döngü), `akım` büyükse akıntı
           verisi birikmiş demektir. Oyuncuya da suyun canlı olduğunu gösterir. */
       fluidHudLine();
+    if (hudText !== _hudText) { _hudText = hudText; infoEl.textContent = hudText; }
   }
-  waterTintEl.style.opacity = cameraUnderWater() ? "1" : "0";
-  lavaTintEl.style.opacity = cameraInLava() ? "1" : "0";
+  const wt = cameraUnderWater() ? "1" : "0", lt = cameraInLava() ? "1" : "0";
+  if (wt !== _waterTintV) { _waterTintV = wt; waterTintEl.style.opacity = wt; }
+  if (lt !== _lavaTintV)  { _lavaTintV = lt;  lavaTintEl.style.opacity = lt; }
 }
 
 /* =========================================================================
