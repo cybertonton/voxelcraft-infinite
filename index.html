@@ -1552,6 +1552,7 @@ function reseed(seed) {
   nRgn       = makeNoise(worldSeed + 11);
   nLava      = makeNoise(worldSeed + 12);
   hcStamp++;
+  if (typeof terrainBroadcastSeed === "function") { popWait.clear(); terrainBroadcastSeed(); }
 }
 
 /* ---- Per-column terrain sampling. Pure function of global (x, z). ---- */
@@ -1957,6 +1958,7 @@ class Chunk {
     this.dirty = false;
     this.queued = false;
     this.meshing = false;     // a Worker job is in flight for this chunk
+    this.terrainPending = false;  // terrain Worker job in flight
     this.meshEpoch = 0;       // bumped on every remesh; stale results are dropped
     this.deepMesh = false;    // meshed all the way down, caves included
     this.plantMesh = false;   // plants included (false = uzak halkada atlandı)
@@ -2243,10 +2245,11 @@ function fluidCanEnter(t) {
 
 /* ========================= TERRAIN GENERATION =========================== */
 
-function generateTerrain(c) {
-  if (c.state >= ST_TERRAIN) return;
-  const ox = c.cx * CH, oz = c.cz * CH;
-  const blocks = c.blocks;
+/*  Saf kısım: yalnızca (cx, cz, tohum, mevsim) -> blok dizisi. Ana thread'e
+    hiçbir şey bağlı değil, bu yüzden aynı kaynak (toString ile) terrain
+    Worker'ına da gömülür — bkz. TERRAIN_SRC.                                */
+function fillTerrainBlocks(blocks, cx, cz) {
+  const ox = cx * CH, oz = cz * CH;
 
   for (let lz = 0; lz < CH; lz++) {
     const wz = oz + lz;
@@ -2308,6 +2311,11 @@ function generateTerrain(c) {
       for (let y = h + 1; y <= wl; y++) blocks[lidx(lx, y, lz)] = WATER;
     }
   }
+}
+
+function generateTerrain(c) {
+  if (c.state >= ST_TERRAIN) return;
+  fillTerrainBlocks(c.blocks, c.cx, c.cz);
   c.state = ST_TERRAIN;
 }
 
@@ -5692,6 +5700,124 @@ try {
 
 const MAX_INFLIGHT = Math.max(2, meshWorkers.length * 2);
 
+/* ========================= TERRAIN WORKER POOL ==========================
+
+   generateTerrain was the heaviest thing left on the main thread: ~16x16x(h)
+   voxels per chunk, each with several 3D noise evaluations. The pure part
+   (fillTerrainBlocks and everything it calls) is shipped to Workers as source
+   text via Function#toString, so there is still exactly one implementation.
+
+   Populate (trees, plants, spills, edits) stays on the main thread — it
+   needs neighbouring chunks and the edit overlay — but it only starts once
+   all nine chunks of its 3x3 have arrived, exactly as the sync path required.
+   Any synchronous caller (spawn, teleport, mesh fallback) still generates in
+   place; a worker result that arrives for a chunk that is no longer EMPTY is
+   simply dropped.                                                          */
+
+const TERRAIN_FNS = [mulberry32, hash3, makeNoise, computeColumn, hcSlot,
+                     columnInfo, isCave, isLavaPocket, oreAt,
+                     fillTerrainBlocks];
+const TERRAIN_CONSTS = { CH, CH_BITS, WY, SEA, HC_BITS, LAVA_MAX_Y,
+  AIR, GRASS, DIRT, STONE, SAND, SNOW, BEDROCK, GRAVEL, WATER, LAVA, SANDSTONE,
+  BIOME_OCEAN, BIOME_BEACH, BIOME_PLAINS, BIOME_FOREST, BIOME_DESERT,
+  BIOME_MOUNTAIN, BIOME_SNOW, BIOME_RIVER };
+
+const TERRAIN_SRC = `
+${Object.entries(TERRAIN_CONSTS).map(([k, v]) => `const ${k} = ${v};`).join("\n")}
+const HC_SIZE = 1 << HC_BITS, HC_MASK = HC_SIZE - 1;
+const CHUNK_VOL = CH * WY * CH;
+const lidx = (lx, y, lz) => (y * CH + lz) * CH + lx;
+const ORE_BANDS = ${JSON.stringify(ORE_BANDS)};
+const sstep = ${sstep.toString()};
+const sampleHeight = ${sampleHeight.toString()};
+const hcTag = new Int32Array(HC_SIZE), hcX = new Int32Array(HC_SIZE), hcZ = new Int32Array(HC_SIZE);
+const hcH = new Float32Array(HC_SIZE), hcWL = new Float32Array(HC_SIZE);
+const hcRV = new Float32Array(HC_SIZE), hcHB = new Float32Array(HC_SIZE);
+let hcStamp = 0, worldSeed = 0;
+let nContinent, nHills, nRough, nTemp, nHumid, nCave, nTree, nRiver, nWarp, nOre, nRgn, nLava;
+const season = { temp: 0 };
+${TERRAIN_FNS.map(f => f.toString()).join("\n")}
+function setSeed(seed) {
+  worldSeed = seed >>> 0;
+  nContinent = makeNoise(worldSeed + 1);  nHills = makeNoise(worldSeed + 2);
+  nRough     = makeNoise(worldSeed + 3);  nTemp  = makeNoise(worldSeed + 4);
+  nHumid     = makeNoise(worldSeed + 5);  nCave  = makeNoise(worldSeed + 6);
+  nTree      = makeNoise(worldSeed + 7);  nRiver = makeNoise(worldSeed + 8);
+  nWarp      = makeNoise(worldSeed + 9);  nOre   = makeNoise(worldSeed + 10);
+  nRgn       = makeNoise(worldSeed + 11); nLava  = makeNoise(worldSeed + 12);
+  hcStamp++;
+}
+self.onmessage = function (e) {
+  const d = e.data;
+  if (d.seed !== undefined) { setSeed(d.seed); return; }
+  season.temp = d.temp;
+  const blocks = new Uint8Array(CHUNK_VOL);
+  fillTerrainBlocks(blocks, d.cx, d.cz);
+  self.postMessage({ cx: d.cx, cz: d.cz, uid: d.uid, epoch: d.epoch, blocks }, [blocks.buffer]);
+};
+`;
+
+const terrainWorkers = [];
+let terrainRR = 0, terrainInflight = 0, terrainEpoch = 0;
+const TERRAIN_MAX_INFLIGHT = 24;
+
+try {
+  const turl = URL.createObjectURL(new Blob([TERRAIN_SRC], { type: "text/javascript" }));
+  const n = Math.max(1, Math.min(2, (navigator.hardwareConcurrency || 4) - 2));
+  for (let i = 0; i < n; i++) {
+    const w = new Worker(turl);
+    w.onmessage = onTerrainResult;
+    // A broken terrain worker must never wedge the game: drop the pool and let
+    // the synchronous path take over (pending chunks are regenerated in place).
+    w.onerror = () => { terrainWorkers.length = 0; terrainInflight = 0; };
+    terrainWorkers.push(w);
+  }
+} catch (err) {
+  terrainWorkers.length = 0;
+}
+
+function terrainBroadcastSeed() {
+  terrainEpoch++;
+  terrainInflight = 0;
+  for (const w of terrainWorkers) w.postMessage({ seed: worldSeed });
+}
+
+function requestTerrain(c) {
+  if (c.terrainPending || c.state >= ST_TERRAIN) return;
+  c.terrainPending = true;
+  terrainInflight++;
+  terrainWorkers[terrainRR++ % terrainWorkers.length]
+    .postMessage({ cx: c.cx, cz: c.cz, uid: c.uid, epoch: terrainEpoch, temp: season.temp });
+}
+
+function onTerrainResult(e) {
+  const d = e.data;
+  if (d.epoch !== terrainEpoch) return;           // old world; counter was reset
+  terrainInflight = Math.max(0, terrainInflight - 1);
+  const c = chunkMap.get(ckey(d.cx, d.cz));
+  if (!c || c.uid !== d.uid) return;               // unloaded meanwhile
+  c.terrainPending = false;
+  if (c.state !== ST_EMPTY) return;                // generated synchronously already
+  c.blocks.set(d.blocks);
+  c.state = ST_TERRAIN;
+}
+
+// Ask for the 3x3 around (cx, cz); true once every one of them has terrain.
+function terrain3x3Ready(cx, cz) {
+  let ready = true;
+  for (let dz = -1; dz <= 1; dz++)
+    for (let dx = -1; dx <= 1; dx++) {
+      const n = getOrCreateChunk(cx + dx, cz + dz);
+      if (n.state >= ST_TERRAIN) continue;
+      ready = false;
+      requestTerrain(n);
+    }
+  return ready;
+}
+
+// Entries whose terrain is still on its way: key -> { c, cx, cz }, nearest first.
+const popWait = new Map();
+
 function takeVolume() {
   const v = volPool.pop();
   if (v) { v.fill(0); return v; }
@@ -6254,13 +6380,52 @@ function streamChunks(pos) {
   const deadline = performance.now() + budget;
 
   // --- generation, nearest first ---
-  while (genCursor < genQueue.length && performance.now() < deadline) {
+  const rd2 = RENDER_DIST * RENDER_DIST;
+  if (terrainWorkers.length) {
+    /*  Async path: terrain comes from the Workers; the main thread only runs
+        populate once a chunk's whole 3x3 has landed. */
+    for (const [k, w] of popWait) {
+      if (performance.now() >= deadline) break;
+      if (chunkMap.get(k) !== w.c) { popWait.delete(k); continue; }
+      if (!terrain3x3Ready(w.cx, w.cz)) continue;
+      popWait.delete(k);
+      populateChunk(w.c);
+      const dx = w.cx - pcx, dz = w.cz - pcz;
+      if (dx * dx + dz * dz <= rd2) enqueueMesh(w.c);
+    }
+    while (genCursor < genQueue.length && terrainInflight < TERRAIN_MAX_INFLIGHT &&
+           terrainWorkers.length && performance.now() < deadline) {
+      const e = genQueue[genCursor++];
+      const cx = e[0], cz = e[1], k = ckey(cx, cz);
+      genQueued.delete(k);
+      const c = getOrCreateChunk(cx, cz);
+      if (c.state >= ST_POPULATED) {
+        const dx = cx - pcx, dz = cz - pcz;
+        if (dx * dx + dz * dz <= rd2) enqueueMesh(c);
+        continue;
+      }
+      if (popWait.has(k)) continue;
+      if (terrain3x3Ready(cx, cz)) {
+        populateChunk(c);
+        const dx = cx - pcx, dz = cz - pcz;
+        if (dx * dx + dz * dz <= rd2) enqueueMesh(c);
+      } else {
+        popWait.set(k, { c, cx, cz });
+      }
+    }
+  }
+  // Synchronous path (no Workers, or the pool just died).
+  if (!terrainWorkers.length && popWait.size) {
+    for (const w of popWait.values()) ensureQueuedGen(w.cx, w.cz);   // hand back to the plain queue
+    popWait.clear();
+  }
+  while (!terrainWorkers.length && genCursor < genQueue.length && performance.now() < deadline) {
     const e = genQueue[genCursor++];
     genQueued.delete(ckey(e[0], e[1]));
     const cx = e[0], cz = e[1];
     const c = ensurePopulated(cx, cz);
     const dx = cx - pcx, dz = cz - pcz;
-    if (dx * dx + dz * dz <= RENDER_DIST * RENDER_DIST) enqueueMesh(c);
+    if (dx * dx + dz * dz <= rd2) enqueueMesh(c);
   }
 
   /*  --- meshing ---
@@ -6307,7 +6472,7 @@ function streamChunks(pos) {
 
   compactQueues();
   streamStats.loaded = chunkMap.size;
-  streamStats.pendingGen = genQueue.length - genCursor;
+  streamStats.pendingGen = genQueue.length - genCursor + popWait.size;
   streamStats.pendingMesh = meshQueue.length - meshCursor;
 }
 
@@ -6379,6 +6544,19 @@ function surfaceY(x, z) {
   for (let dz = -1; dz <= 1; dz++)
     for (let dx = -1; dx <= 1; dx++)
       ensurePopulated(pcx + dx, pcz + dz);
+  for (let y = WY - 2; y > 0; y--) {
+    if (isSolid(getBlock(x, y, z))) return y + 1;
+  }
+  return SEA + 2;
+}
+
+/*  Read-only twin of surfaceY for cosmetic callers (fog). Never generates:
+    with terrain coming from Workers, forcing a populate here every frame would
+    race ahead of the streaming queue and put all the work back on this thread.
+    Returns -1 when the column's chunk is not populated yet.                 */
+function surfaceYPeek(x, z) {
+  const c = getChunk(x >> CH_BITS, z >> CH_BITS);
+  if (!c || c.state < ST_POPULATED) return -1;
   for (let y = WY - 2; y > 0; y--) {
     if (isSolid(getBlock(x, y, z))) return y + 1;
   }
@@ -9190,6 +9368,7 @@ function moonPhaseName(frac, waxing) {
   return waxing ? "Waxing Gibbous" : "Waning Gibbous";
 }
 
+let _fogSurf = 64, _fogSurfX = NaN, _fogSurfZ = NaN, _fogSurfTimer = 0;
 function updateSky(dt) {
   skyDays += dt * (fastTime ? 0.08 : 0.003);
   const angle = skyDays * Math.PI * 2;
@@ -9313,7 +9492,14 @@ function updateSky(dt) {
     // 1. Subterranean cavern depth detection
     const camBlockX = Math.floor(camera.position.x);
     const camBlockZ = Math.floor(camera.position.z);
-    const localSurf = (typeof surfaceY === "function") ? surfaceY(camBlockX, camBlockZ) : 64;
+    // Column surface only changes with x/z (and rare edits): rescan on column change or ~4 Hz.
+    _fogSurfTimer += dt;
+    if (camBlockX !== _fogSurfX || camBlockZ !== _fogSurfZ || _fogSurfTimer > 0.25) {
+      const sy = surfaceYPeek(camBlockX, camBlockZ);
+      if (sy >= 0) _fogSurf = sy;
+      _fogSurfX = camBlockX; _fogSurfZ = camBlockZ; _fogSurfTimer = 0;
+    }
+    const localSurf = _fogSurf;
     const depthUnder = Math.max(0, localSurf - camera.position.y);
     const targetCaveFog = Math.min(1, Math.max(0, (depthUnder - 3.5) / 7.5));
     _undergroundFogAmount += (targetCaveFog - _undergroundFogAmount) * Math.min(1, dt * 2.5);
