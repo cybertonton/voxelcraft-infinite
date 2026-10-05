@@ -576,30 +576,37 @@ function fogDensityForFar(far) {
   return Math.min(FOG_DENSITY_MAX, Math.max(FOG_DENSITY_MIN, FOG_DENSITY_COEFF / Math.max(8, far)));
 }
 
-/*  ---- Cave torch lighting ----
-    physicallyCorrectLights açık, o yüzden bu point light gerçek ters-kare
-    düşüşle (decay=2, ışık oluşturulurken set ediliyor) sönümleniyor —
-    intensity SUN_INTENSITY/HEMI_DAY gibi 0..1 bir çarpan değil, "1 blok
-    mesafede ne kadar parlak" cinsinden gerçek bir nokta kaynağı skalasında. */
-const TORCH_LIGHT_COLOR     = 0xffaa55; // sıcak alev rengi — hem ışık hem alev mesh'i
+/*  ---- Voxel ışığı (sky + block) ----
+    Işık artık sahnedeki PointLight'lardan değil, mesher'ın hesapladığı voxel
+    ışık alanından geliyor (bkz. MESHER_SRC, "VOXEL LIGHT"). Her hücrede iki
+    kanal var, 0..15:
+      sky   — gökyüzüne açık sütunlardan akan ışık; gün/gece ve hava durumuyla
+              ölçeklenir (hemi + güneş), yani mağara gündüz de karanlık kalır
+      block — meşale/lav/parıltı taşı gibi kaynaklardan akan ışık; sabit
+    Duvarın arkasına sızmaz, kaynak sayısı sınırı yok, piksel başına ışık
+    döngüsü yok. Seviye 15 yarıçapında söner, bu yüzden bir chunk'ın ışığı
+    komşu 3x3 chunk'tan tam olarak hesaplanabiliyor (16 blokluk kenar payı).   */
+const TORCH_LIGHT_COLOR     = 0xffaa55; // sıcak alev rengi — alev mesh'i ve voxel ışık tonu
 const TORCH_STICK_COLOR     = 0x6b4a2c;
-const TORCH_LIGHT_INTENSITY = 42;       // candela-ish; cutoff'tan önce ~intensity/d²
-const TORCH_LIGHT_RANGE     = 11;       // blok; THREE.PointLight distance cutoff
+const TORCH_LEVEL           = 13;       // odun meşalesi blok ışığı seviyesi
+const BLOCK_LIGHT_STRENGTH  = 4.6;      // tam seviye (15) blok ışığının irradiance'ı
+const BLOCK_LIGHT_FALLOFF   = 0.80;     // seviye başına parlaklık çarpanı (MC eğrisi)
+const SKY_LIGHT_FALLOFF     = 0.80;
+const CAVE_AMBIENT_FLOOR    = 0.12;     // sky=0 yerde hemi ışığının kalan oranı
+const SKY_DIRECT_LO         = 8;        // güneşin doğrudan ışığı bu sky seviyesinde sıfır
+const SKY_DIRECT_HI         = 14;       // ... ve bu seviyede tam
+const LIGHT_EDIT_REACH      = 15;       // bir edit'in ışığı en fazla bu kadar blok etkiler
 
-/*  ---- Kömür meşalesi ışığı ----
+/*  ---- Kömür meşalesi ----
     Kömür, odundan çok daha yoğun bir yakıt; oyuncunun madende kömür
-    aramasının ÖDÜLÜ tam olarak burada görünür olmalı. Şiddeti ~2.4x,
-    menzili ~1.6x: bir kömür meşalesi, üç odun meşalesinin kapladığı
-    koridoru tek başına aydınlatıyor. Renk de daha beyaza yakın (daha
-    sıcak yanan alev daha az sarı görünür), bu yüzden mağarada iki meşale
-    tipi yan yana durduğunda hangisi olduğu ışıktan bile anlaşılıyor.    */
+    aramasının ÖDÜLÜ görünür olmalı: odun meşalesinden 2 seviye parlak
+    (tavan 15) ve alevi/halosu daha büyük ve beyaza yakın.                */
 const COAL_TORCH_LIGHT_COLOR     = 0xffd9a0;
-const COAL_TORCH_LIGHT_INTENSITY = 100;
-const COAL_TORCH_LIGHT_RANGE     = 18;
+const COAL_TORCH_LEVEL           = 15;
 const COAL_TORCH_GLOW_SIZE       = 3.4;
 
-const TORCH_ACTIVE_RANGE    = 40;       // blok; bunun ötesindeki meşalenin ne mesh'i ne ışığı var
-let   TORCH_MAX_ACTIVE      = 48;       // aynı anda canlı olabilecek meşale sayısı tavanı (adaptif, bkz. adaptQuality)
+const TORCH_ACTIVE_RANGE    = 64;       // blok; bunun ötesindeki meşalenin görsel mesh'i yok
+let   TORCH_MAX_ACTIVE      = 160;      // canlı olabilecek meşale görseli tavanı (artık ışık değil, ucuz mesh; bkz. adaptQuality)
 const TORCH_RESYNC_MS       = 200;      // aktif küme ne sıklıkla yeniden hesaplanır
 const TORCH_FADE_SPEED      = 7;        // 1/s; pop olmasın diye üstel fade in/out
 const TORCH_GLOW_SIZE       = 2.4;      // additive glow sprite'ının dünya-uzayı boyutu
@@ -679,11 +686,12 @@ const BLOCKS = [
   { name:"Dead Bush",   top:T_DEADBUSH,  side:T_DEADBUSH,   bottom:T_DEADBUSH, solid:0, opaque:0, plant:1, selectable:1, color:0x8a6b3a },
   /*  Torch: `plant` değil, `opaque`/`transparent` de değil — mesher'da SIFIR
       geometri üretmeli (aşağıdaki `noMesh` ve MESHER_SRC'deki kullanımına
-      bak), çünkü gerçek görünümü bağımsız bir THREE.Group + PointLight,
-      atlas'a bakan bir mesh yüzü değil. top/side/bottom yine de gerçek bir
+      bak), çünkü gerçek görünümü bağımsız bir THREE.Group (sap+alev+halo),
+      atlas'a bakan bir mesh yüzü değil. Işığı `light` alanından, yani
+      voxel ışık alanından gelir (MESHER_SRC'deki "VOXEL LIGHT"). top/side/bottom yine de gerçek bir
       atlas tile'ına işaret ediyor — sadece 2D hotbar ikonu (buildHotbar())
       atlasCanvas'tan bir şey kırpabilsin diye.                             */
-  { name:"Torch",       top:T_TORCH,     side:T_TORCH,      bottom:T_TORCH,    solid:0, opaque:0, selectable:1, noMesh:1, color:0xffaa55 },
+  { name:"Torch",       top:T_TORCH,     side:T_TORCH,      bottom:T_TORCH,    solid:0, opaque:0, selectable:1, noMesh:1, light:TORCH_LEVEL, color:0xffaa55 },
   { name:"Ice",         top:T_ICE,       side:T_ICE,        bottom:T_ICE,     solid:1, opaque:0, transparent:1, selectable:1, color:0xa8d8f0 },
 
   /*  ---- Cevher blokları ----
@@ -698,9 +706,9 @@ const BLOCKS = [
   { name:"Elmas Cevheri",  top:T_DIAMOND_ORE, side:T_DIAMOND_ORE, bottom:T_DIAMOND_ORE, solid:1, opaque:1, selectable:1, mineTier:2, color:0x5fe8dc },
 
   /*  Kömür meşalesi: TORCH ile aynı mesher sözleşmesi (noMesh:1, kendi
-      Group+PointLight'ı var), sadece ışık profili daha güçlü. `torchKind`
+      Group'u var), sadece ışık seviyesi daha yüksek. `torchKind`
       ışık sistemine hangi profili kullanacağını söyler.                   */
-  { name:"Kömür Meşalesi", top:T_COAL_TORCH, side:T_COAL_TORCH, bottom:T_COAL_TORCH, solid:0, opaque:0, selectable:1, noMesh:1, torchKind:1, color:0xffd08a },
+  { name:"Kömür Meşalesi", top:T_COAL_TORCH, side:T_COAL_TORCH, bottom:T_COAL_TORCH, solid:0, opaque:0, selectable:1, noMesh:1, torchKind:1, light:COAL_TORCH_LEVEL, color:0xffd08a },
 
   /*  Lav: WATER ile aynı "akışkan" ailesinden ama tersi bir kimlikle.
       `opaque:1` + `solid:0` kombinasyonu bilinçli: ışığı WATER gibi
@@ -709,7 +717,7 @@ const BLOCKS = [
       tehlike de tam olarak bunun sonucu. `selectable:0`, tıpkı su gibi,
       normal madencilik ışınının onu görmezden geçmesini sağlıyor;
       toplamak için (su gibi) kova gerekiyor (bkz. raycastFluidTarget).   */
-  { name:"Lav", top:T_LAVA, side:T_LAVA, bottom:T_LAVA, solid:0, opaque:1, selectable:0, color:0xff5a1f, lava:1 },
+  { name:"Lav", top:T_LAVA, side:T_LAVA, bottom:T_LAVA, solid:0, opaque:1, selectable:0, light:15, color:0xff5a1f, lava:1 },
 
   /*  ---- Kırık taş ----
       Taşın MC döngüsündeki hâli: kazıyla taş kırılınca düşen şey budur,
@@ -732,10 +740,10 @@ const BLOCKS = [
 
   /*  ---- Parıltı taşı ----
       Kendinden ışıklı dekor bloğu: emissive atlas'a ekli (bkz.
-      EMISSIVE_TILES), yani meşale gibi PointLight taşımadan kendi
-      dokusundan ışık yayıyor — lavla aynı teknik, madencilik ödülü
+      EMISSIVE_TILES), yani kendi dokusundan ışık yayıyor, ve `light:15` ile
+      çevresini voxel ışığıyla da aydınlatıyor — lavla aynı teknik, madencilik ödülü
       altın külçesiyle craft edilir.                                       */
-  { name:"Parıltı Taşı", top:T_GLOWSTONE, side:T_GLOWSTONE, bottom:T_GLOWSTONE, solid:1, opaque:1, selectable:1, mineTier:0, color:0xffd97a },
+  { name:"Parıltı Taşı", top:T_GLOWSTONE, side:T_GLOWSTONE, bottom:T_GLOWSTONE, solid:1, opaque:1, selectable:1, mineTier:0, light:15, color:0xffd97a },
 
   /*  ---- Depolama blokları ----
       9 eşya <-> 1 blok (çift yönlü tarifler). Maden ocağının getirdiği
@@ -758,6 +766,13 @@ const isLava = t => t === LAVA;
     yerleştirme mantığı bunu kullanır; yeni bir meşale çeşidi eklemek
     yalnızca bu listeye bir satır demek.                                   */
 const isTorchBlock = t => t === TORCH || t === COAL_TORCH;
+
+/*  Işığı etkileyen her şey tek bir sayıda: opak mı, ne kadar ışık yayıyor,
+    su mu (gökyüzü ışığını kısar). İki blok aynı sınıftaysa birini diğerinin
+    yerine koymak voxel ışığını DEĞİŞTİRMEZ, yani komşu chunk'ları yeniden
+    örmeye gerek yok.                                                       */
+const LIGHT_CLASS = BLOCKS.map((b, id) =>
+  b ? ((b.opaque ? 1 : 0) | ((b.light || 0) << 1) | (id === WATER ? 1 << 6 : 0)) : 0);
 
 /*  Per-tile PBR values. Index is the atlas tile, not the block, because the
     atlases are what the shader samples. [roughness, bumpStrength]           */
@@ -1959,6 +1974,7 @@ class Chunk {
     this.queued = false;
     this.meshing = false;     // a Worker job is in flight for this chunk
     this.terrainPending = false;  // terrain Worker job in flight
+    this.light = null;        // Uint8Array: (sky << 4) | block per cell, from the last mesh job
     this.meshEpoch = 0;       // bumped on every remesh; stale results are dropped
     this.deepMesh = false;    // meshed all the way down, caves included
     this.plantMesh = false;   // plants included (false = uzak halkada atlandı)
@@ -3198,7 +3214,7 @@ function lavaStep() {
         getBlock(x, y + 1, z) === WATER || getBlock(x, y - 1, z) === WATER ||
         getBlock(x, y, z + 1) === WATER || getBlock(x, y, z - 1) === WATER) {
       c.blocks[i] = STONE;
-      markChunkDirty(cx, cz);
+      markLightDirty(x, z);
       spawnParticles(x + 0.5, y + 0.5, z + 0.5, STONE);
       sfxSplash();
       continue;
@@ -3212,7 +3228,7 @@ function lavaStep() {
       const bc = chunkMap.get(ckey(x >> CH_BITS, z >> CH_BITS));
       if (bc && bc.state >= ST_POPULATED) {
         bc.blocks[lidx(x & CH_MASK, y - 1, z & CH_MASK)] = LAVA;
-        markChunkDirty(cx, cz);
+        markLightDirty(x, z);
         lavaWake(x, y - 1, z, spread);   // düşen sütun aynı bütçeyle devam eder
       }
       continue;   // düşerken yana yayılmaz — şelale gövdesi ince kalır
@@ -3225,7 +3241,7 @@ function lavaStep() {
       const nc = chunkMap.get(ckey(nx >> CH_BITS, nz >> CH_BITS));
       if (!nc || nc.state < ST_POPULATED) continue;
       nc.blocks[lidx(nx & CH_MASK, y, nz & CH_MASK)] = LAVA;
-      markChunkDirty(nx >> CH_BITS, nz >> CH_BITS);
+      markLightDirty(nx, nz);
       lavaWake(nx, y, nz, spread - 1);
     }
   }
@@ -3703,7 +3719,7 @@ function buildPbrAtlases(colorCanvas) {
 
 /*  Kendinden-ışıklı tile'lar (emissive atlas).
 
-    Meşale gibi noMesh olan bloklar kendi Group+PointLight'ını taşıyor, ama
+    Meşale gibi noMesh olan bloklar kendi Group'unu taşıyor, ama
     LAV gerçek bir mesh yüzeyi (bkz. BLOCKS'taki not) — yani ışığı normal bir
     MeshStandardMaterial gibi PBR zincirinden almalı. Three'nin emissiveMap'i
     tam bunun için var: renk atlasının KENDİSİNİ (lav zaten kendi parlaklığını
@@ -3852,9 +3868,10 @@ sunLight.shadow.normalBias = 0.03;
 scene.add(sunLight, sunLight.target);
 
 /*  ---- Adaptif kalite ----
-    fps düştüğünde önce en pahalı GPU özelliklerini kıs: dinamik meşale
-    ışıklarının sayısı (her piksel 48 ışıklı döngü öder) ve gölge haritası
-    çözünürlüğü (2048 -> 1024, %75 daha az gölge texel işi). Histerezisli:
+    fps düştüğünde önce en pahalı GPU özelliklerini kıs: meşale görsellerinin
+    sayısı ve gölge haritası çözünürlüğü (2048 -> 1024, %75 daha az gölge
+    texel işi). Işığın kendisi voxel olduğu için ayrıca kısılacak bir şey yok.
+    Histerezisli:
     sürekli 50 fps sınırında titreyip kaliteyi gereksiz yere sıfırlamaz.
     r128'de sunLight.shadow.map'i null'lamak bir sonraki karede yeni
     mapSize ile yeniden tahsis edilmesini sağlar (mapPass dahil).       */
@@ -3866,7 +3883,7 @@ function adaptQuality() {
   if (!perfLow && fps < 45) perfLow = true;
   else if (perfLow && fps > 55) perfLow = false;
 
-  TORCH_MAX_ACTIVE = perfLow ? 16 : 48;
+  TORCH_MAX_ACTIVE = perfLow ? 48 : 160;
 
   /*  Fill-rate is the other big GPU lever: antialias cannot change at runtime,
       but the pixel ratio can. Drop it while struggling, restore on recovery. */
@@ -3912,6 +3929,45 @@ const ATLAS_UV_GLSL = `
 
 const swayUniforms = { uTime: { value: 0 }, uSwayAmp: { value: 0.06 } };
 
+/*  ---- Voxel ışığının shader tarafı ----
+    Mesher her köşeye (AO, sky, block) üçlüsünü `color` olarak yazar. Burada:
+      * AO albedo'yu çarpar (eskisi gibi)
+      * sky ışığı HEMİSFER ışığını ve güneşin doğrudan ışığını ölçekler;
+        bu yüzden gölge haritasının görmediği yerlerde (kapalı hava, gölgeler
+        kapalıyken, harita menzili dışı) bile mağara ve çatı altı karanlık
+      * block ışığı sıcak bir irradiance olarak eklenir
+    Hepsi ortak bir uniform kümesinden okunur; tek yerden ayarlanır.           */
+const lightUniforms = {
+  uBlockColor:    { value: new THREE.Color(TORCH_LIGHT_COLOR).convertSRGBToLinear().lerp(new THREE.Color(1, 1, 1), 0.38) },
+  uBlockStrength: { value: BLOCK_LIGHT_STRENGTH },
+  uBlockFlicker:  { value: 1 },
+  uBlockFall:     { value: BLOCK_LIGHT_FALLOFF },
+  uSkyFall:       { value: SKY_LIGHT_FALLOFF },
+  uCaveFloor:     { value: CAVE_AMBIENT_FLOOR },
+  uSkyDirLo:      { value: SKY_DIRECT_LO },
+  uSkyDirHi:      { value: SKY_DIRECT_HI },
+  /*  0 at night, 1 under a clear midday sun (updateSky). Daylight washes out
+      block light wherever the sky is also visible, as it does in real life:
+      a torch is a glow at night and nearly invisible at noon.               */
+  uDaylight:      { value: 1 }
+};
+const LIGHT_UNIFORM_GLSL = `
+  uniform vec3  uBlockColor;
+  uniform float uBlockStrength;
+  uniform float uBlockFlicker;
+  uniform float uBlockFall;
+  uniform float uSkyFall;
+  uniform float uCaveFloor;
+  uniform float uSkyDirLo;
+  uniform float uSkyDirHi;
+  uniform float uDaylight;
+  // 15 -> 1.0, falling by k per level, and exactly 0 at level 0.
+  float lightCurve(float L, float k) {
+    float c0 = pow(k, 15.0);
+    return max(0.0, (pow(k, 15.0 - L) - c0) / (1.0 - c0));
+  }
+`;
+
 /*  `emissive` opsiyonu lav için eklendi: emissiveMap'i de (diğer haritalar
     gibi) atlasUV() ile örnekletir VE ışığı hafifçe zamanla nabız gibi
     oynatır — donuk, sabit bir "parlak doku" değil, gerçekten için için
@@ -3925,6 +3981,7 @@ function patchAtlasMaterial(mat, sway, emissive) {
       shader.uniforms.uTime = swayUniforms.uTime;
     }
     if (sway) shader.uniforms.uSwayAmp = swayUniforms.uSwayAmp;
+    Object.assign(shader.uniforms, lightUniforms);
 
     shader.vertexShader = shader.vertexShader
       .replace("#include <common>", `
@@ -3958,6 +4015,31 @@ function patchAtlasMaterial(mat, sway, emissive) {
         varying vec2 vTileOrg;
         varying float vWorldY_HF;
         ${emissive ? "uniform float uTime;" : ""}
+        ${LIGHT_UNIFORM_GLSL}
+      `)
+      /*  vColor = (ambient occlusion, sky, block). Three would multiply all
+          three into the albedo; only the first belongs there.                */
+      .replace("#include <color_fragment>", `
+        diffuseColor.rgb *= vColor.r;
+        float vlSky = clamp(vColor.g, 0.0, 1.0) * 15.0;
+        float vlBlk = clamp(vColor.b, 0.0, 1.0) * 15.0;
+      `)
+      /*  Runs after the direct-light loops (sun only: there are no dynamic
+          point lights any more) and before the indirect term is folded into
+          reflectedLight, so \`irradiance\` is still ours to edit.              */
+      .replace("#include <lights_fragment_end>", `
+        {
+          float skyAmb    = mix(uCaveFloor, 1.0, lightCurve(vlSky, uSkyFall));
+          float skyDirect = smoothstep(uSkyDirLo, uSkyDirHi, vlSky);
+          reflectedLight.directDiffuse  *= skyDirect;
+          reflectedLight.directSpecular *= skyDirect;
+          #if defined( RE_IndirectDiffuse )
+            irradiance *= skyAmb;
+            float dayWash = 1.0 - 0.82 * uDaylight * smoothstep(8.0, 15.0, vlSky);
+            irradiance += uBlockColor * (lightCurve(vlBlk, uBlockFall) * uBlockFlicker * uBlockStrength * dayWash);
+          #endif
+        }
+        #include <lights_fragment_end>
       `)
       /*  vUv is declared by <uv_pars_fragment>, which three includes AFTER
            <common> — so atlasUV() must be defined here, not up there, or the
@@ -4083,7 +4165,16 @@ const matWater = new THREE.ShaderMaterial({
     /*  Üstel sis yoğunluğu: far=135 için kalibre density; updateWaterFX her kare
         scene.fog.density'den besler (lineer near/far yerine).                    */
     uFogDensity:  { value: fogDensityForFar(135) },
-    uUnderwater:  { value: 0 }
+    uUnderwater:  { value: 0 },
+    uBlockColor:    lightUniforms.uBlockColor,
+    uBlockStrength: lightUniforms.uBlockStrength,
+    uBlockFlicker:  lightUniforms.uBlockFlicker,
+    uBlockFall:     lightUniforms.uBlockFall,
+    uSkyFall:       lightUniforms.uSkyFall,
+    uCaveFloor:     lightUniforms.uCaveFloor,
+    uSkyDirLo:      lightUniforms.uSkyDirLo,
+    uSkyDirHi:      lightUniforms.uSkyDirHi,
+    uDaylight:      lightUniforms.uDaylight
   },
 
   vertexShader: `
@@ -4092,7 +4183,9 @@ const matWater = new THREE.ShaderMaterial({
     /*  wflow: akışkan simülasyonundan gelen gerçek akış durumu.
         xy = akış vektörü (dünya xz), z = düşme bayrağı, w = 0..1 seviye.   */
     attribute vec4 wflow;
+    attribute vec2 wlight;         // voxel light of the open cell this face looks into: sky, block (0..1)
 
+    varying vec2  vWL;
     varying vec3  vWorldPos;
     varying vec3  vNormalW;
     varying float vDepth;
@@ -4109,6 +4202,7 @@ const matWater = new THREE.ShaderMaterial({
 
     void main() {
       vec3 wp = (modelMatrix * vec4(position, 1.0)).xyz;
+      vWL    = wlight;
       vTop   = wdata.x;
       vDepth = wdata.y;
       vShore = wdata.z;
@@ -4171,7 +4265,8 @@ const matWater = new THREE.ShaderMaterial({
     }
   `,
 
-  fragmentShader: TONEMAP_GLSL + `
+  fragmentShader: TONEMAP_GLSL + LIGHT_UNIFORM_GLSL + `
+    varying vec2  vWL;
     uniform float uTime;
     uniform vec3  uSunDir;
     uniform vec3  uSunColor;
@@ -4396,6 +4491,17 @@ const matWater = new THREE.ShaderMaterial({
         // With depth writes off, a thin far wall of water can otherwise be
         // seen straight through from inside the body. Thicken it.
         alpha = mix(alpha, min(1.0, alpha + 0.30), uw);
+      }
+
+      /*  ---- Voxel ışığı ----
+          Mağaradaki göl gündüz de karanlık kalmalı; meşale suyu sıcak
+          aydınlatır. Hava sahnesindeki gibi sky ışığı gövdeyi ölçekler. */
+      {
+        float wSky = lightCurve(vWL.x * 15.0, uSkyFall);
+        float wBlk = lightCurve(vWL.y * 15.0, uBlockFall) * uBlockFlicker
+                   * (1.0 - 0.82 * uDaylight * smoothstep(8.0 / 15.0, 1.0, vWL.x));
+        col *= mix(uCaveFloor, 1.0, wSky);
+        col += (uShallow + 0.05) * uBlockColor * (wBlk * uBlockStrength * 0.16);
       }
 
       /*  ---- FogExp2 + Height Fog ----
@@ -5042,7 +5148,9 @@ scene.add(outline);
 /* ============================ TORCH LIGHTS ============================= */
 
 const torchLights   = new Map();   // "x,y,z" -> TorchLight, yerleştirilmiş/geri yüklenmiş her meşale
-const activeTorches = new Set();   // canlı group+light'a sahip TorchLight'lar
+const activeTorches = new Set();   // canlı görsel group'a (sap+alev+halo) sahip TorchLight'lar
+/*  Meşalenin ışığı artık voxel ışık alanından geliyor (bkz. MESHER_SRC); bu
+    kayıt sadece alev/halo/duman görseli ve titreşim içindir.                */
 let torchResyncTimer = 0;
 let torchClock = 0;
 
@@ -5091,20 +5199,16 @@ const coalGlowMat = new THREE.SpriteMaterial({
   depthWrite: false, fog: false
 });
 
-/*  Meşale çeşidi başına ışık profili. Işık sistemi artık tek bir sabit
-    seti değil bu tabloyu okuyor, yani üçüncü bir meşale (mesela "lav
-    meşalesi") eklemek buraya bir satır demek — activateTorch/update
-    fonksiyonlarına dokunmak gerekmiyor.                                 */
+/*  Meşale çeşidi başına görsel profil. Işık seviyesi blok tablosundaki
+    `light` alanından geliyor (BLOCKS); burada sadece görünüm var.           */
 const TORCH_PROFILES = [
   {   // 0 = odun meşalesi
-    color: TORCH_LIGHT_COLOR, intensity: TORCH_LIGHT_INTENSITY,
-    range: TORCH_LIGHT_RANGE, glowSize: TORCH_GLOW_SIZE,
+    color: TORCH_LIGHT_COLOR, glowSize: TORCH_GLOW_SIZE,
     flameGeo: torchFlameGeo, flameMat: torchFlameMat,
     glowMat: torchGlowMat, flameY: 0.55, lump: false
   },
   {   // 1 = kömür meşalesi
-    color: COAL_TORCH_LIGHT_COLOR, intensity: COAL_TORCH_LIGHT_INTENSITY,
-    range: COAL_TORCH_LIGHT_RANGE, glowSize: COAL_TORCH_GLOW_SIZE,
+    color: COAL_TORCH_LIGHT_COLOR, glowSize: COAL_TORCH_GLOW_SIZE,
     flameGeo: coalTorchFlameGeo, flameMat: coalTorchFlameMat,
     glowMat: coalGlowMat, flameY: 0.60, lump: true
   }
@@ -5117,7 +5221,7 @@ function registerTorch(x, y, z, kind) {
   if (torchLights.has(key)) return;
   torchLights.set(key, {
     x, y, z, kind: kind || 0, seed: Math.random() * 1000,
-    group: null, light: null, fade: 0, targetActive: false, _d2: 0
+    group: null, fade: 0, targetActive: false, _d2: 0
   });
   torchResyncTimer = 0;
 }
@@ -5126,12 +5230,12 @@ function unregisterTorch(x, y, z) {
   const key = tKey(x, y, z);
   const tl = torchLights.get(key);
   if (!tl) return;
-  if (tl.group) { scene.remove(tl.group); scene.remove(tl.light); activeTorches.delete(tl); }
+  if (tl.group) { scene.remove(tl.group); activeTorches.delete(tl); }
   torchLights.delete(key);
 }
 
 function clearTorchLights() {
-  for (const tl of activeTorches) { scene.remove(tl.group); scene.remove(tl.light); }
+  for (const tl of activeTorches) scene.remove(tl.group);
   activeTorches.clear();
   torchLights.clear();
   torchResyncTimer = 0;
@@ -5165,12 +5269,7 @@ function activateTorch(tl) {
 
   scene.add(g);
 
-  const light = new THREE.PointLight(prof.color, 0, prof.range, 2);
-  light.position.set(tl.x + 0.5, tl.y + 0.6, tl.z + 0.5);
-  light.castShadow = false;
-  scene.add(light);
-
-  tl.group = g; tl.light = light; tl.fade = 0;
+  tl.group = g; tl.fade = 0;
   activeTorches.add(tl);
 }
 
@@ -5201,6 +5300,12 @@ function resyncTorchActivation(camPos) {
 
 function updateTorchLights(dt) {
   torchClock += dt;
+  // One slow, shared flame flicker for every block-lit surface: a few percent,
+  // enough to read as fire without crawling across the walls.
+  lightUniforms.uBlockFlicker.value = 1
+    + 0.030 * Math.sin(torchClock * 9.7)
+    + 0.018 * Math.sin(torchClock * 4.1 + 1.3)
+    + 0.012 * Math.sin(torchClock * 21.3 + 2.1);
   torchResyncTimer -= dt * 1000;
   if (torchResyncTimer <= 0) {
     torchResyncTimer = TORCH_RESYNC_MS;
@@ -5215,8 +5320,8 @@ function updateTorchLights(dt) {
     if (Math.abs(target - tl.fade) < 0.004) tl.fade = target;
 
     if (tl.fade <= 0 && !tl.targetActive) {
-      scene.remove(tl.group); scene.remove(tl.light);
-      tl.group = null; tl.light = null;
+      scene.remove(tl.group);
+      tl.group = null;
       activeTorches.delete(tl);
       continue;
     }
@@ -5228,9 +5333,9 @@ function updateTorchLights(dt) {
       + 0.035 * Math.sin(torchClock * 23.1 + p * 3.1);
     const eased = tl.fade * tl.fade * (3 - 2 * tl.fade);
 
-    const prof = TORCH_PROFILES[tl.kind] || TORCH_PROFILES[0];
-    tl.light.intensity = prof.intensity * Math.max(0, flicker) * eased;
-    tl.group.scale.setScalar(eased);
+    // The halo breathes with the flame; the light itself flickers globally
+    // (lightUniforms.uBlockFlicker, set below) so it never touches the mesh.
+    tl.group.scale.setScalar(eased * (0.94 + 0.06 * flicker));
 
     // Termal duman ve kıvılcım parçacık emisyonu (yalnızca aktif ve kameraya yakın meşaleler)
     if (tl.fade > 0.5 && tl._d2 < 676 && typeof spawnSmoke === "function") {
@@ -5249,6 +5354,73 @@ function updateTorchLights(dt) {
           color: tl.kind === 1 ? 0xffea9f : 0xff9922
         });
       }
+    }
+  }
+}
+
+/* ========================= ENTITY LIGHTING ==============================
+
+    Arazi ışığı köşe başına pişiyor; mob'lar, el ve avatar ise sahnedeki
+    sahne ışıklarıyla (güneş + hemisfer) çiziliyor, yani mağarada gündüz gibi
+    parlarlardı. Her biri bulunduğu hücrenin voxel ışığını örnekler
+    (chunk.light, mesher'ın ürünü) ve materyal renklerini bununla ölçekler:
+    sky -> genel parlaklık, block -> sıcak bir ek. Orijinal renk korunur; biri
+    materyali dışarıdan yeniden boyarsa (yün boyama, vurulma parlaması) yeni
+    renk taban olur.                                                          */
+const litRoots = new Map();
+function registerLitRoot(root, getPos) { litRoots.set(root, { getPos, mats: null, sky: 15, blk: 0, init: false }); }
+function unregisterLitRoot(root) { litRoots.delete(root); }
+
+// Packed (sky << 4) | block of the cell containing (x, y, z); open sky where unknown.
+function lightAt(x, y, z) {
+  const fy = Math.floor(y);
+  if (fy < 0) return 0;
+  if (fy >= WY) return 0xF0;
+  const fx = Math.floor(x), fz = Math.floor(z);
+  const c = chunkMap.get(ckey(fx >> CH_BITS, fz >> CH_BITS));
+  if (!c || !c.light) return 0xF0;
+  return c.light[lidx(fx & CH_MASK, fy, fz & CH_MASK)];
+}
+
+function lightCurveJS(L, k) {
+  const c0 = Math.pow(k, 15);
+  return Math.max(0, (Math.pow(k, 15 - L) - c0) / (1 - c0));
+}
+
+const _litFactor = new THREE.Color();
+function updateEntityLighting(dt) {
+  const kk = 1 - Math.exp(-8 * dt);
+  for (const [root, e] of litRoots) {
+    if (!root.visible) continue;
+    const pos = e.getPos();
+    // Three heights: a mob half inside a block would otherwise sample solid rock (0).
+    let sky = 0, blk = 0;
+    for (let i = 0; i < 3; i++) {
+      const v = lightAt(pos.x, pos.y + 0.3 + i * 0.65, pos.z);
+      if ((v >> 4) > sky) sky = v >> 4;
+      if ((v & 15) > blk) blk = v & 15;
+    }
+    if (!e.init) { e.sky = sky; e.blk = blk; e.init = true; }
+    else { e.sky += (sky - e.sky) * kk; e.blk += (blk - e.blk) * kk; }
+
+    const base = CAVE_AMBIENT_FLOOR * 4 + (1 - CAVE_AMBIENT_FLOOR * 4) * lightCurveJS(e.sky, SKY_LIGHT_FALLOFF);
+    const dayWash = 1 - 0.82 * lightUniforms.uDaylight.value * Math.min(1, Math.max(0, (e.sky - 8) / 7));
+    const add  = lightCurveJS(e.blk, BLOCK_LIGHT_FALLOFF) * lightUniforms.uBlockFlicker.value * 0.9 * dayWash;
+    _litFactor.setRGB(Math.min(1.8, base + add), Math.min(1.8, base + add * 0.62), Math.min(1.8, base + add * 0.30));
+
+    if (!e.mats) {
+      e.mats = new Set();
+      root.traverse(o => {
+        if (!o.isMesh) return;
+        for (const m of (Array.isArray(o.material) ? o.material : [o.material])) if (m && m.color) e.mats.add(m);
+      });
+    }
+    for (const m of e.mats) {
+      const u = m.userData;
+      if (!u.litBase) { u.litBase = m.color.clone(); u.litLast = m.color.clone(); }
+      else if (!m.color.equals(u.litLast)) u.litBase.copy(m.color);   // recoloured from outside
+      m.color.copy(u.litBase).multiply(_litFactor);
+      u.litLast.copy(m.color);
     }
   }
 }
@@ -5307,8 +5479,143 @@ const B_NOMESH = new Uint8Array([${BLOCKS.map(b => (b && b.noMesh) ? 1 : 0).join
 const B_TOP    = new Uint8Array([${BLOCKS.map(b => b ? b.top : 0).join(",")}]);
 const B_SIDE   = new Uint8Array([${BLOCKS.map(b => b ? b.side : 0).join(",")}]);
 const B_BOT    = new Uint8Array([${BLOCKS.map(b => b ? b.bottom : 0).join(",")}]);
+const B_EMIT   = new Uint8Array([${BLOCKS.map(b => (b && b.light) ? b.light : 0).join(",")}]);
 
 const pvi = (x, y, z) => ((y + 1) * PV + (z + 1)) * PV + (x + 1);
+
+/* ============================ VOXEL LIGHT ================================
+
+   Two 0..15 channels per cell: sky (light from open sky) and block (light
+   from emitters: torches, lava, glowstone). Both are flood-filled with a
+   decay of 1 per step, never through opaque cells, so light cannot leak
+   through a wall and a torch needs no dynamic light source at all.
+
+   The field is computed for a 3x3 chunk REGION and only the middle chunk is
+   kept. Light dies out after 15 steps and the region reaches 16 blocks past
+   the middle chunk on every side, so every cell we keep sees every source
+   that could reach it: no seams between chunks, and no state shared between
+   chunks or between worker and main thread — the field is a pure function of
+   the nine block arrays. (Missing neighbours read as air, like the padded
+   volume does.)
+
+   The region is stored with one extra layer above and below the world so
+   faces on y = 0 / y = WY-1 have a neighbour cell to sample.                 */
+const RW = CH * 3, RSY = RW * RW, RH = WY + 2, RLEN = RSY * RH;
+const RSTR = [1, RSY, RW];                           // strides by axis (x, y, z)
+const RBASE = RSY + CH * RW + CH;                    // region index of chunk-local (0, 0, 0)
+const CHUNK_VOL = CH * WY * CH;
+const QN = 1 << 19, QM = QN - 1;                     // circular BFS queue
+
+const RB = new Uint8Array(RLEN);                     // region blocks
+const SKY = new Uint8Array(RLEN);
+const BLK = new Uint8Array(RLEN);
+const TOPY = new Int16Array(RW * RW);                // padded y of the highest opaque cell, -1 if none
+const HIY  = new Int16Array(RW * RW);                // highest cell whose sky level is not a plain 15: max(TOPY, top water)
+const QU = new Int32Array(QN);
+
+/*  Level-relaxation flood fill. Seeds are already in QU[head..tail) with
+    their levels written into A. A cell is re-queued only when its level
+    strictly improves, so the result is exact whatever the seed order.      */
+function floodFill(A, head, tail) {
+  while (head !== tail) {
+    const p = QU[head]; head = (head + 1) & QM;
+    const L = A[p];
+    if (L <= 1) continue;
+    const nl = L - 1;
+    const yp = (p / RSY) | 0, rem = p - yp * RSY, rz = (rem / RW) | 0, rx = rem - rz * RW;
+    let n;
+    if (rx > 0)       { n = p - 1;   if (A[n] < nl && !B_OPAQUE[RB[n]]) { A[n] = nl; QU[tail] = n; tail = (tail + 1) & QM; } }
+    if (rx < RW - 1)  { n = p + 1;   if (A[n] < nl && !B_OPAQUE[RB[n]]) { A[n] = nl; QU[tail] = n; tail = (tail + 1) & QM; } }
+    if (rz > 0)       { n = p - RW;  if (A[n] < nl && !B_OPAQUE[RB[n]]) { A[n] = nl; QU[tail] = n; tail = (tail + 1) & QM; } }
+    if (rz < RW - 1)  { n = p + RW;  if (A[n] < nl && !B_OPAQUE[RB[n]]) { A[n] = nl; QU[tail] = n; tail = (tail + 1) & QM; } }
+    if (yp > 0)       { n = p - RSY; if (A[n] < nl && !B_OPAQUE[RB[n]]) { A[n] = nl; QU[tail] = n; tail = (tail + 1) & QM; } }
+    if (yp < RH - 1)  { n = p + RSY; if (A[n] < nl && !B_OPAQUE[RB[n]]) { A[n] = nl; QU[tail] = n; tail = (tail + 1) & QM; } }
+  }
+}
+
+/*  reg: nine chunk block arrays back to back, index (dz + 1) * 3 + (dx + 1).
+    Fills RB, SKY and BLK. */
+function computeLight(reg) {
+  // ---- unpack into region layout; collect emitters as block-light seeds ----
+  RB.fill(0); BLK.fill(0); SKY.fill(0);
+  let bTail = 0;
+  for (let j = 0; j < 9; j++) {
+    const ox = (j % 3) * CH, oz = ((j / 3) | 0) * CH, src = j * CHUNK_VOL;
+    for (let y = 0; y < WY; y++) {
+      for (let lz = 0; lz < CH; lz++) {
+        let s = src + (y * CH + lz) * CH;
+        let d = (y + 1) * RSY + (oz + lz) * RW + ox;
+        for (let lx = 0; lx < CH; lx++, s++, d++) {
+          const b = reg[s];
+          if (b === 0) continue;
+          RB[d] = b;
+          const e = B_EMIT[b];
+          if (e) { BLK[d] = e; if (bTail < QN - 1) QU[bTail++] = d; }
+        }
+      }
+    }
+  }
+
+  // Block light first: its seeds live in QU[0..bTail) and the sky pass reuses the queue.
+  floodFill(BLK, 0, bTail);
+
+  // ---- sky: straight-down columns first (full strength; water dims it) ----
+  for (let rz = 0; rz < RW; rz++) {
+    for (let rx = 0; rx < RW; rx++) {
+      let lvl = 15, top = -1, wTop = -1;
+      let p = (RH - 1) * RSY + rz * RW + rx;
+      for (let yp = RH - 1; yp >= 0; yp--, p -= RSY) {
+        const b = RB[p];
+        if (B_OPAQUE[b]) { top = yp; break; }
+        if (b === WATER) { if (wTop < 0) wTop = yp; if (lvl > 0) lvl = lvl > 2 ? lvl - 2 : 0; }
+        SKY[p] = lvl;
+      }
+      TOPY[rz * RW + rx] = top;
+      HIY[rz * RW + rx] = wTop > top ? wTop : top;
+    }
+  }
+
+  /*  ---- sky seeds ----
+      Wherever a neighbouring column has something in the way (solid rock or
+      dimming water) at a height this column is open, light can spill sideways.
+      Everywhere else the plain column values are already final.             */
+  let sTail = 0;
+  for (let rz = 0; rz < RW; rz++) {
+    for (let rx = 0; rx < RW; rx++) {
+      const c = rz * RW + rx, top = TOPY[c];
+      let nb = HIY[c];
+      if (rx > 0      && HIY[c - 1]  > nb) nb = HIY[c - 1];
+      if (rx < RW - 1 && HIY[c + 1]  > nb) nb = HIY[c + 1];
+      if (rz > 0      && HIY[c - RW] > nb) nb = HIY[c - RW];
+      if (rz < RW - 1 && HIY[c + RW] > nb) nb = HIY[c + RW];
+      if (nb <= top) continue;
+      // One layer past nb: the open cell right above the highest water spills down into it.
+      const yEnd = nb + 1 < RH ? nb + 1 : RH - 1;
+      let p = (top + 1) * RSY + c;
+      for (let yp = top + 1; yp <= yEnd; yp++, p += RSY) {
+        if (SKY[p] > 1) { QU[sTail] = p; sTail = (sTail + 1) & QM; }
+      }
+    }
+  }
+  floodFill(SKY, 0, sTail);
+}
+
+/*  Smooth light at one corner of a face: the mean of the (up to) four cells
+    that touch the corner on the open side of the face, skipping opaque cells
+    so light does not bend around a solid edge. Returned in quarter levels
+    (0..60) so equal values compare exactly and pack into six bits.          */
+function cornerLight(A, rn, d1, d2) {
+  const s1 = rn + d1, s2 = rn + d2;
+  const o1 = B_OPAQUE[RB[s1]], o2 = B_OPAQUE[RB[s2]];
+  let sum = A[rn], cnt = 1;
+  if (!o1) { sum += A[s1]; cnt++; }
+  if (!o2) { sum += A[s2]; cnt++; }
+  if (!(o1 && o2)) {
+    const dg = rn + d1 + d2;
+    if (!B_OPAQUE[RB[dg]]) { sum += A[dg]; cnt++; }
+  }
+  return Math.round(sum * 4 / cnt);
+}
 
 /*  [axis, sign, uAxis, vAxis, sFromU]
 
@@ -5328,6 +5635,9 @@ const GF = [
 ];
 
 const MASK = new Int32Array(Math.max(CH * WY, CH * CH));
+// Per-cell corner light (4 corners x 6 bits each), kept beside MASK because the
+// merge key already uses all 32 bits it has.
+const MASKS = new Int32Array(MASK.length), MASKB = new Int32Array(MASK.length);
 
 /*  Strides through the padded volume, indexed by axis. The mask sweep visits
     a couple of hundred thousand cells per chunk, so its addressing is done
@@ -5336,12 +5646,28 @@ const MASK = new Int32Array(Math.max(CH * WY, CH * CH));
 const STR = [1, PV * PV, PV];              // x, y, z
 const VBASE = PV * PV + PV + 1;            // index of local (0, 0, 0)
 
-function meshVolume(vol, yLo, yHi, lev, flow, skipPlants) {
+/*  Returns { groups, light }. light is the middle chunk's light field in
+    chunk layout, (sky << 4) | block, for the main thread to sample.        */
+function meshVolume(vol, yLo, yHi, lev, flow, skipPlants, reg) {
   // 0 = opaque, 1 = glass, 2 = water, 3 = plants
   const P = [[], [], [], []], N = [[], [], [], []], U = [[], [], [], []],
         C = [[], [], [], []], T = [[], [], [], []], I = [[], [], [], []];
   const W = [];                                     // wdata, water only
   const WF = [];                                    // wflow, water only
+  const WL = [];                                    // light (sky, block), water only
+
+  const lightOut = new Uint8Array(CHUNK_VOL);
+  if (yHi < yLo) {                                  // nothing to mesh: all open sky
+    lightOut.fill(0xF0);
+    return { groups: [null, null, null, null], light: lightOut };
+  }
+  computeLight(reg);
+  for (let y = 0; y < WY; y++) {
+    for (let z = 0; z < CH; z++) {
+      let r = RBASE + y * RSY + z * RW, o = (y * CH + z) * CH;
+      for (let x = 0; x < CH; x++, r++, o++) lightOut[o] = (SKY[r] << 4) | BLK[r];
+    }
+  }
 
   const size = [CH, WY, CH];
   const lo = [0, yLo, 0], hi = [CH - 1, yHi, CH - 1];
@@ -5401,13 +5727,17 @@ function meshVolume(vol, yLo, yHi, lev, flow, skipPlants) {
 
     const sL = STR[ax], sU = STR[uA], sV = STR[vA];
     const nOff = sg * sL;
+    const rL = RSTR[ax], rU = RSTR[uA], rV = RSTR[vA];
+    const rNOff = sg * rL;
 
     for (let L = lo[ax]; L <= hi[ax]; L++) {
       let any = false;
       const lBase = VBASE + L * sL;
+      const rl = RBASE + L * rL;
 
       for (let vv = vLo; vv <= vHi; vv++) {
         const vBase = lBase + vv * sV;
+        const rv = rl + vv * rV;
         const mRow = vv * nU;
         for (let uu = uLo; uu <= uHi; uu++) {
           MASK[mRow + uu] = -1;
@@ -5440,6 +5770,13 @@ function meshVolume(vol, yLo, yHi, lev, flow, skipPlants) {
           const ao2 = (um && vp) ? 0 : 3 - um - vp - cmp;
           const ao3 = (up && vp) ? 0 : 3 - up - vp - cpp;
 
+          // Smooth voxel light at the four corners, sampled on the open side.
+          const rn = rv + uu * rU + rNOff;
+          MASKS[mRow + uu] = cornerLight(SKY, rn, -rU, -rV) | (cornerLight(SKY, rn, rU, -rV) << 6) |
+                             (cornerLight(SKY, rn, -rU, rV) << 12) | (cornerLight(SKY, rn, rU, rV) << 18);
+          MASKB[mRow + uu] = cornerLight(BLK, rn, -rU, -rV) | (cornerLight(BLK, rn, rU, -rV) << 6) |
+                             (cornerLight(BLK, rn, -rU, rV) << 12) | (cornerLight(BLK, rn, rU, rV) << 18);
+
           MASK[mRow + uu] = tile | (grp << 14) |
             (ao0 << 6) | (ao1 << 8) | (ao2 << 10) | (ao3 << 12);
           any = true;
@@ -5462,15 +5799,26 @@ function meshVolume(vol, yLo, yHi, lev, flow, skipPlants) {
               gradient would smear across the whole run instead of repeating
               every block. The quad corners keep the pattern either way; this
               just caps how far the pattern is stretched.                     */
-          const mergeU = (i0 === i1 && i2 === i3);
-          const mergeV = (i0 === i2 && i1 === i3);
+          const m0 = vv * nU + uu;
+          const ls = MASKS[m0], lb = MASKB[m0];
+          const s0 = ls & 63, s1 = (ls >> 6) & 63, s2 = (ls >> 12) & 63, s3 = (ls >> 18) & 63;
+          const b0 = lb & 63, b1 = (lb >> 6) & 63, b2 = (lb >> 12) & 63, b3 = (lb >> 18) & 63;
+          const mergeU = (i0 === i1 && i2 === i3 && s0 === s1 && s2 === s3 && b0 === b1 && b2 === b3);
+          const mergeV = (i0 === i2 && i1 === i3 && s0 === s2 && s1 === s3 && b0 === b2 && b1 === b3);
 
           let w = 1;
-          while (mergeU && uu + w <= uHi && MASK[vv * nU + uu + w] === key) w++;
+          while (mergeU && uu + w <= uHi) {
+            const m = vv * nU + uu + w;
+            if (MASK[m] !== key || MASKS[m] !== ls || MASKB[m] !== lb) break;
+            w++;
+          }
 
           let h = 1;
           grow: while (mergeV && vv + h <= vHi) {
-            for (let i = 0; i < w; i++) if (MASK[(vv + h) * nU + uu + i] !== key) break grow;
+            for (let i = 0; i < w; i++) {
+              const m = (vv + h) * nU + uu + i;
+              if (MASK[m] !== key || MASKS[m] !== ls || MASKB[m] !== lb) break grow;
+            }
             h++;
           }
 
@@ -5485,13 +5833,16 @@ function meshVolume(vol, yLo, yHi, lev, flow, skipPlants) {
           // A(0,0) B(w,0) C(0,h) D(w,h) in (u, v).
           const du = [0, w, 0, w], dv = [0, 0, h, h];
           const aoV = [ao0, ao1, ao2, ao3];
+          const skV = [s0 / 60, s1 / 60, s2 / 60, s3 / 60];
+          const bkV = [b0 / 60, b1 / 60, b2 / 60, b3 / 60];
           for (let k = 0; k < 4; k++) {
             const vp = [0, 0, 0];
             vp[ax] = plane; vp[uA] = uu + du[k]; vp[vA] = vv + dv[k];
             P[g].push(vp[0], vp[1], vp[2]);
             N[g].push(nrm[0], nrm[1], nrm[2]);
             if (sFromU) U[g].push(du[k], dv[k]); else U[g].push(dv[k], du[k]);
-            C[g].push(aoV[k], aoV[k], aoV[k]);
+            // colour = (ambient occlusion, sky light, block light); see patchAtlasMaterial
+            C[g].push(aoV[k], skV[k], bkV[k]);
             T[g].push(tile);
           }
 
@@ -5520,6 +5871,8 @@ function meshVolume(vol, yLo, yHi, lev, flow, skipPlants) {
 
         if (B_PLANT[type]) {
           if (skipPlants) continue;
+          const pr = RBASE + y * RSY + z * RW + x;
+          const plSky = SKY[pr] / 15, plBlk = BLK[pr] / 15;
           const g = 3, tile = B_SIDE[type];
           const s = 0.15, e = 0.85;
           const quads = [[s, s, e, e], [s, e, e, s]];   // the two diagonals
@@ -5535,7 +5888,7 @@ function meshVolume(vol, yLo, yHi, lev, flow, skipPlants) {
               N[g].push(0, 1, 0);
               U[g].push(k & 1 ? 1 : 0, k > 1 ? 1 : 0);
               const shade = k > 1 ? 1.0 : 0.72;      // rooted in shadow
-              C[g].push(shade, shade, shade);
+              C[g].push(shade, plSky, plBlk);
               T[g].push(tile);
             }
             I[g].push(base, base + 1, base + 2, base + 2, base + 1, base + 3);
@@ -5586,6 +5939,8 @@ function meshVolume(vol, yLo, yHi, lev, flow, skipPlants) {
 
           const g = 2, plane = (ax === 0 ? x : ax === 1 ? y : z) + (sg > 0 ? 1 : 0);
           const nrm = [0, 0, 0]; nrm[ax] = sg;
+          const wr = RBASE + y * RSY + z * RW + x + sg * RSTR[ax];   // the open cell this face looks into
+          const wlSky = SKY[wr] / 15, wlBlk = BLK[wr] / 15;
           const base = P[g].length / 3;
           const du = [0, 1, 0, 1], dv = [0, 0, 1, 1];
           for (let k = 0; k < 4; k++) {
@@ -5614,6 +5969,7 @@ function meshVolume(vol, yLo, yHi, lev, flow, skipPlants) {
             P[g].push(vp[0], vp[1], vp[2]);
             N[g].push(nrm[0], nrm[1], nrm[2]);
             W.push(topFlag, wDepth, wLand);
+            WL.push(wlSky, wlBlk);
             /*  wflow: akış yönü + düşme + seviye. Shader dokuyu bu yöne
                 kaydırır ve düşen suya dikey çizgiler çizer.             */
             WF.push(flowX, flowZ, isFall, myLev / WLEV_MAX);
@@ -5636,6 +5992,7 @@ function meshVolume(vol, yLo, yHi, lev, flow, skipPlants) {
     if (g === 2) {
       out.wdata = new Float32Array(W);
       out.wflow = new Float32Array(WF);
+      out.wlight = new Float32Array(WL);
     } else {
       out.uv   = new Float32Array(U[g]);
       out.col  = new Float32Array(C[g]);
@@ -5643,7 +6000,7 @@ function meshVolume(vol, yLo, yHi, lev, flow, skipPlants) {
     }
     groups.push(out);
   }
-  return groups;
+  return { groups, light: lightOut };
 }
 `;
 
@@ -5655,19 +6012,20 @@ const { meshVolume } = (new Function(MESHER_SRC + "\nreturn { meshVolume };"))()
 const WORKER_TAIL = `
 self.onmessage = function (e) {
   const d = e.data;
-  const groups = meshVolume(d.vol, d.yLo, d.yHi, d.lev, d.flow, d.skipPlants);
-  // vol/lev/flow tamponları geri gönderilir ki havuza dönüp yeniden kullanılsın.
-  const transfer = [d.vol.buffer];
+  const res = meshVolume(d.vol, d.yLo, d.yHi, d.lev, d.flow, d.skipPlants, d.reg);
+  const groups = res.groups;
+  // vol/lev/flow/reg tamponları geri gönderilir ki havuza dönüp yeniden kullanılsın.
+  const transfer = [d.vol.buffer, d.reg.buffer, res.light.buffer];
   if (d.lev)  transfer.push(d.lev.buffer);
   if (d.flow) transfer.push(d.flow.buffer);
   for (const g of groups) {
     if (!g) continue;
     transfer.push(g.pos.buffer, g.nor.buffer, g.idx.buffer);
-    if (g.wdata) transfer.push(g.wdata.buffer, g.wflow.buffer);
+    if (g.wdata) transfer.push(g.wdata.buffer, g.wflow.buffer, g.wlight.buffer);
     else transfer.push(g.uv.buffer, g.col.buffer, g.tile.buffer);
   }
   self.postMessage({ cx: d.cx, cz: d.cz, uid: d.uid, jobId: d.jobId, epoch: d.epoch,
-                    groups: groups, vol: d.vol, lev: d.lev, flow: d.flow }, transfer);
+                    groups: groups, light: res.light, vol: d.vol, reg: d.reg, lev: d.lev, flow: d.flow }, transfer);
 };
 `;
 
@@ -5822,6 +6180,24 @@ function takeVolume() {
   const v = volPool.pop();
   if (v) { v.fill(0); return v; }
   return new Uint8Array(PV_LEN);
+}
+
+/*  Lighting input: the chunk and its eight neighbours' block arrays, back to
+    back in (dz, dx) row-major order. Each chunk's array is contiguous, so this
+    is nine memcpy's — the worker does the unpacking (see computeLight).
+    Neighbours that do not exist read as air.                                */
+const regPool = [];
+function buildLightRegion(c) {
+  const reg = regPool.pop() || new Uint8Array(9 * CHUNK_VOL);
+  for (let dz = -1; dz <= 1; dz++) {
+    for (let dx = -1; dx <= 1; dx++) {
+      const n = (dx === 0 && dz === 0) ? c : getChunk(c.cx + dx, c.cz + dz);
+      const off = ((dz + 1) * 3 + (dx + 1)) * CHUNK_VOL;
+      if (n) reg.set(n.blocks, off);
+      else reg.fill(0, off, off + CHUNK_VOL);
+    }
+  }
+  return reg;
 }
 
 /*  Su seviyesi ve akış tamponları da havuzlanır. Bunlar sadece suyu olan
@@ -5991,6 +6367,7 @@ function onWorkerMesh(e) {
   }
   // d.vol was transferred back to us, so reuse it instead of copying ~42 KB.
   volPool.push(d.vol);
+  regPool.push(d.reg);
   if (d.lev)  levPool.push(d.lev);
   if (d.flow) flowPool.push(d.flow);
   const c = getChunk(d.cx, d.cz);
@@ -5998,6 +6375,7 @@ function onWorkerMesh(e) {
   // chunk at the same coords has a fresh epoch, so epoch alone cannot tell).
   if (!c || c.uid !== d.uid || c.meshEpoch !== d.epoch) { c && (c.meshing = false); return; }
   c.meshing = false;
+  c.light = d.light;
   applyMeshResult(c, d.groups);
 }
 
@@ -6035,6 +6413,7 @@ function buildChunkMesh(c, forceSync, deep, hasPlants) {
   if (!forceSync && meshWorkers.length && inflight < MAX_INFLIGHT) {
     const { vol, yLo, yHi } = buildPaddedVolume(c, deep);
     const { lev, flow } = fillFluidPadding(c, yLo, yHi);
+    const reg = buildLightRegion(c);
     c.meshing = true;
     inflight++;
     const jobId = nextJobId++;
@@ -6042,11 +6421,11 @@ function buildChunkMesh(c, forceSync, deep, hasPlants) {
     let jobs = workerJobs.get(w);
     if (!jobs) { jobs = new Map(); workerJobs.set(w, jobs); }
     jobs.set(ckey(c.cx, c.cz), jobId);
-    const xfer = [vol.buffer];
+    const xfer = [vol.buffer, reg.buffer];
     if (lev)  xfer.push(lev.buffer);
     if (flow) xfer.push(flow.buffer);
     w.postMessage({ cx: c.cx, cz: c.cz, uid: c.uid, jobId, epoch: c.meshEpoch,
-                    vol, yLo, yHi, lev, flow, skipPlants }, xfer);
+                    vol, yLo, yHi, lev, flow, skipPlants, reg }, xfer);
     // Mark it built so the streaming queue stops re-offering it; the geometry
     // lands a few milliseconds later.
     c.meshed = true;
@@ -6056,11 +6435,14 @@ function buildChunkMesh(c, forceSync, deep, hasPlants) {
 
   const { vol, yLo, yHi } = buildPaddedVolume(c, deep);
   const { lev, flow } = fillFluidPadding(c, yLo, yHi);
-  const groups = meshVolume(vol, yLo, yHi, lev, flow, skipPlants);
+  const reg = buildLightRegion(c);
+  const res = meshVolume(vol, yLo, yHi, lev, flow, skipPlants, reg);
   volPool.push(vol);
+  regPool.push(reg);
   if (lev)  levPool.push(lev);
   if (flow) flowPool.push(flow);
-  applyMeshResult(c, groups);
+  c.light = res.light;
+  applyMeshResult(c, res.groups);
 }
 
 const GROUP_KEY = ["opaque", "trans", "water", "plants"];
@@ -6086,6 +6468,7 @@ function applyGeometry(chunk, key, material, data, group) {
     geo.setAttribute("wdata",  new THREE.BufferAttribute(data.wdata, 3));
     // Akış yönü / düşme / seviye — akan suyun görsel kaydırması için.
     geo.setAttribute("wflow",  new THREE.BufferAttribute(data.wflow, 4));
+    geo.setAttribute("wlight", new THREE.BufferAttribute(data.wlight, 2));
   } else {
     geo.setAttribute("uv",     new THREE.BufferAttribute(data.uv, 2));
     geo.setAttribute("color",  new THREE.BufferAttribute(data.col, 3));
@@ -6208,6 +6591,23 @@ function markChunkDirty(cx, cz) {
       meshQueue.splice(meshCursor, 0, c);
     }
   }
+}
+
+/*  Mark every chunk that voxel light from a change at (x, z) can reach. Light
+    spreads in 6-connected steps, so reach is the Manhattan distance from the
+    edit to the nearest cell of the neighbour. The edited chunk goes last:
+    markChunkDirty queues at the cursor, so last in means first out.         */
+function markLightDirty(x, z) {
+  const cx = x >> CH_BITS, cz = z >> CH_BITS, lx = x & CH_MASK, lz = z & CH_MASK;
+  for (let dz = -1; dz <= 1; dz++) {
+    for (let dx = -1; dx <= 1; dx++) {
+      if (dx === 0 && dz === 0) continue;
+      const ax = dx < 0 ? lx + 1 : dx > 0 ? CH - lx : 0;
+      const az = dz < 0 ? lz + 1 : dz > 0 ? CH - lz : 0;
+      if (ax + az <= LIGHT_EDIT_REACH) markChunkDirty(cx + dx, cz + dz);
+    }
+  }
+  markChunkDirty(cx, cz);
 }
 
 function rebuildQueues(pcx, pcz) {
@@ -7019,6 +7419,7 @@ const dog = (() => {
   root.name = "Köpek";
   root.visible = false;
   scene.add(root);
+  registerLitRoot(root, () => root.position);
 
   const bodyMat = new THREE.MeshStandardMaterial({ color: 0xc59b69, roughness: 0.92 });
   const creamMat = new THREE.MeshStandardMaterial({ color: 0xf0ddbd, roughness: 0.94 });
@@ -7231,6 +7632,7 @@ const sheep = (() => {
   root.name = "Koyun";
   root.visible = false;
   scene.add(root);
+  registerLitRoot(root, () => root.position);
 
   // Materyaller
   const woolColorDefault = 0xf4f0ea;
@@ -7762,12 +8164,14 @@ const zombies = (() => {
       wander: Math.random() * 6.28, idle: 0, hitCd: 0.6, flash: 0, burn: 0, groanCd: 2 + Math.random() * 4, stuck: 0
     };
     m.root.position.copy(z0.pos);
+    registerLitRoot(m.root, () => z0.pos);
     list.push(z0);
     return z0;
   }
 
   function remove(i) {
     const z = list[i];
+    unregisterLitRoot(z.model.root);
     scene.remove(z.model.root);
     for (const k in z.model.mats) z.model.mats[k].dispose();
     list.splice(i, 1);
@@ -8143,6 +8547,7 @@ const avatar = (function buildAvatar() {
   const tilt  = new THREE.Group(); tilt.position.set(0, 0.9, 0);   // swim pivot
   const inner = new THREE.Group(); inner.position.set(0, -0.9, 0); // undo it
   tilt.add(inner); root.add(tilt); scene.add(root);
+  registerLitRoot(root, () => root.position);
 
   const upper = new THREE.Group(); upper.position.set(0, hipY, 0); // sneak pivot
   inner.add(upper);
@@ -8661,6 +9066,11 @@ function setBlock(x, y, z, t) {
     if (old === WATER && t !== WATER && c.wlev) { c.wlev[li] = 0; c.wflag[li] = 0; }
     if (t === WATER && old !== WATER && c.wlev) { c.wlev[li] = WLEV_MAX; c.wflag[li] = 0; }
   }
+
+  /*  Opaklığı ya da ışık yayımını değiştiren bir edit, 15 blok içindeki her
+      chunk'ın ışığını değiştirebilir — yani yalnızca kenar komşuları değil,
+      ışığın erişebileceği tüm 3x3 komşuluğu yeniden örülür.                  */
+  if (old !== t && LIGHT_CLASS[old] !== LIGHT_CLASS[t]) { markLightDirty(x, z); return; }
 
   markChunkDirty(cx, cz);
   if (lx === 0)         markChunkDirty(cx - 1, cz);
@@ -9607,6 +10017,7 @@ function updateSky(dt) {
   sunLight.intensity *= 1 - 0.85 * oc;
   sunLight.castShadow = shadowsOn && sunLight.intensity > 0.35 && oc < 0.8;
   sunLight.color.convertSRGBToLinear();
+  lightUniforms.uDaylight.value = above ? Math.min(1, e * 2.4) * (1 - 0.6 * oc) : 0;
 
   /*  Extra fill while the sun is near the horizon, tinted toward the sunset.
       Without it the key light has already faded but the sky is still bright,
@@ -13618,7 +14029,7 @@ function animate(now) {
   // Stream even while paused, so the world is ready when you click in.
   if (ready) streamChunks(player.pos);
 
-  if (ready) updateTorchLights(dt);
+  if (ready) { updateTorchLights(dt); updateEntityLighting(dt); }
 
   swayUniforms.uTime.value += dt;
 
